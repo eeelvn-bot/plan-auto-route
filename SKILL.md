@@ -11,6 +11,14 @@ Do not substitute older road-aligned refinement flows (for example `v72-route-pl
 For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
 `skills/plan-auto-route/scripts/plan_auto_route_v15_legacy.py`.
 
+## Dependency
+
+- Required upstream data skill: `city-data-downloader`
+- Repository: https://github.com/eeelvn-bot/city-data-downloader
+- Recommended order:
+  1) run `city-data-downloader` to prepare city POI/landuse/hydro/population/transport layers
+  2) run `plan-auto-route` for OD planning and altitude profile generation
+
 ## What it does
 
 1. Builds a route graph from open data (roads + waterways).
