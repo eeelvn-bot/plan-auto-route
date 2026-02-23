@@ -20,6 +20,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib import error, parse, request
 
 import folium
+from folium.plugins import HeatMap
 import pyproj
 from osgeo import gdal
 from shapely.geometry import LineString, Point, Polygon, shape
@@ -47,6 +48,7 @@ DEFAULT_OPENTOPO_ENDPOINT = "https://api.opentopodata.org/v1/srtm90m"
 ALGORITHM_VERSION = "plan-auto-route-latest-air-corridor-v4-refactor-landuse-softnofly-astarfix"
 OVERPASS_CACHE_DIR = Path(__file__).resolve().parents[3] / "output" / "overpass_cache"
 DEFAULT_PARETO_POLICY_FILE = Path(__file__).resolve().parents[1] / "config" / "pareto_policies.json"
+DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON = Path(__file__).resolve().parents[1] / "config" / "civil_airport_no_fly.geojson"
 
 DEFAULT_AIRFRAME = {
     "speed_ms": 12.0,
@@ -63,9 +65,14 @@ AIR_LATTICE_MAX_OFFSET_M = 3200.0
 ROUTE_BUFFER_M = 100.0
 HIGH_BUILDING_THRESHOLD_M = 80.0
 HIGH_BUILDING_AVOID_BUFFER_M = 35.0
+HIGH_VOLTAGE_LINE_MIN_V = 220000.0
+HIGH_VOLTAGE_LINE_BUFFER_M = 45.0
 WATER_PREF_MIN_FACTOR = 0.18
 WATER_PREF_MAX_FACTOR = 1.0
-SCHOOL_HARD_BUFFER_M = 90.0
+SAFETY_SENSITIVE_HARD_BUFFER_M = 100.0
+SAFETY_INFRA_HARD_BUFFER_M = 100.0
+CRITICAL_INFRA_MIN_SEVERITY = 2.0
+SCHOOL_HARD_BUFFER_M = 100.0
 SCHOOL_ENDPOINT_RELIEF_M = 55.0
 NO_FLY_SOFT_HELIPORT_BUFFER_M = 700.0
 NO_FLY_SOFT_HELIPAD_BUFFER_M = 350.0
@@ -99,7 +106,6 @@ WEIGHT_PROFILES = {
         "crowd": 1.0,
         "key_facility": 1.2,
         "line_cross": 2.2,
-        "high_building": 3.5,
     },
     "balanced": {
         "length": 1.0,
@@ -112,7 +118,6 @@ WEIGHT_PROFILES = {
         "crowd": 1.8,
         "key_facility": 2.2,
         "line_cross": 4.0,
-        "high_building": 6.0,
     },
     "safest": {
         "length": 1.1,
@@ -125,7 +130,6 @@ WEIGHT_PROFILES = {
         "crowd": 2.8,
         "key_facility": 3.4,
         "line_cross": 5.5,
-        "high_building": 8.5,
     },
 }
 
@@ -153,12 +157,15 @@ CROWD_POI_TYPES = {
     "amenity:bus_station",
     "amenity:marketplace",
     "amenity:place_of_worship",
+    "amenity:square",
     "amenity:cinema",
     "amenity:theatre",
     "amenity:ferry_terminal",
     "tourism:attraction",
     "tourism:museum",
     "tourism:viewpoint",
+    "leisure:park",
+    "leisure:garden",
     "leisure:stadium",
     "leisure:sports_centre",
     "shop:mall",
@@ -172,6 +179,12 @@ KEY_FACILITY_POI_TYPES = {
     "amenity:townhall",
     "office:government",
     "amenity:research_institute",
+    "amenity:barracks",
+    "landuse:military",
+    "military:barracks",
+    "military:base",
+    "military:airfield",
+    "military:naval_base",
 }
 
 
@@ -188,6 +201,8 @@ class CandidateSpec:
     weight_scale: Dict[str, float]
     school_penalty_air: float
     school_penalty_ground: float
+    enable_sensitive_hard_constraint: bool = False
+    enable_infra_hard_constraint: bool = False
 
 
 def _normalize_pareto_policy(raw: Dict[str, Any]) -> Dict[str, float]:
@@ -576,6 +591,29 @@ def _first_float(value: Any) -> Optional[float]:
         return None
 
 
+def _max_voltage_v(raw_value: Any) -> Optional[float]:
+    if raw_value is None:
+        return None
+    text = str(raw_value).strip().lower()
+    if not text:
+        return None
+    nums = re.findall(r"[-+]?\d+(?:\.\d+)?", text)
+    values: List[float] = []
+    for token in nums:
+        try:
+            values.append(float(token))
+        except Exception:
+            continue
+    if not values:
+        return None
+    max_v = max(values)
+    if "kv" in text and max_v < 10000.0:
+        max_v *= 1000.0
+    if "mv" in text and max_v < 1000.0:
+        max_v *= 1_000_000.0
+    return max_v
+
+
 def _point_from_geojson_geometry(geom_obj: Dict[str, Any]) -> Optional[Point]:
     if not geom_obj:
         return None
@@ -592,34 +630,154 @@ def _point_from_geojson_geometry(geom_obj: Dict[str, Any]) -> Optional[Point]:
         return None
 
 
+def _poi_name_prefer_zh(props: Dict[str, Any], tags: Dict[str, Any]) -> str:
+    candidates: List[str] = []
+    for key in ("name:zh", "name:zh-Hans", "name:zh_CN", "name:zh-Hant", "name"):
+        val = tags.get(key)
+        if val is not None:
+            text = str(val).strip()
+            if text:
+                candidates.append(text)
+    for key in ("name_zh", "name"):
+        val = props.get(key)
+        if val is not None:
+            text = str(val).strip()
+            if text:
+                candidates.append(text)
+    return candidates[0] if candidates else "未命名POI"
+
+
+def _poi_type_label(poi_type: str) -> str:
+    token = str(poi_type or "").strip().lower()
+    labels = {
+        "amenity:school": "学校",
+        "amenity:kindergarten": "幼儿园",
+        "amenity:college": "学院",
+        "amenity:university": "大学",
+        "amenity:hospital": "医院",
+        "amenity:clinic": "诊所",
+        "amenity:bus_station": "公交枢纽",
+        "amenity:marketplace": "集市",
+        "amenity:place_of_worship": "宗教场所",
+        "amenity:square": "广场",
+        "amenity:cinema": "影院",
+        "amenity:theatre": "剧院",
+        "amenity:townhall": "政府机构",
+        "amenity:courthouse": "法院",
+        "amenity:police": "警务设施",
+        "amenity:fire_station": "消防设施",
+        "office:government": "政府办公机构",
+        "shop:mall": "商业中心",
+        "shop:supermarket": "商超",
+        "leisure:park": "公园",
+        "leisure:garden": "园林",
+        "landuse:military": "军事用地",
+    }
+    if token in labels:
+        return labels[token]
+    if token.startswith("military:"):
+        return "军事设施"
+    if token.startswith("amenity:"):
+        return "公共服务设施"
+    if token.startswith("office:"):
+        return "办公设施"
+    if token.startswith("shop:"):
+        return "商业设施"
+    if token.startswith("leisure:"):
+        return "休闲设施"
+    if token.startswith("landuse:"):
+        return "用地设施"
+    return token or "未分类"
+
+
+def _build_poi_tooltip_lookup(items: List[Dict[str, Any]], snap_m: float = 8.0) -> Dict[Tuple[float, float], str]:
+    grouped: Dict[Tuple[float, float], List[str]] = defaultdict(list)
+    for item in items:
+        pt = item.get("point_xy")
+        if pt is None or getattr(pt, "is_empty", True):
+            continue
+        try:
+            key = _round_key((float(pt.x), float(pt.y)), snap_m=snap_m)
+        except Exception:
+            continue
+        name = str(item.get("name", "")).strip() or "未命名POI"
+        type_text = str(item.get("type", "")).strip() or "未分类"
+        source = str(item.get("source", "")).strip()
+        text = f"名称: {name} | 类型: {type_text}"
+        if source:
+            text += f" | 来源: {source}"
+        grouped[key].append(text)
+
+    out: Dict[Tuple[float, float], str] = {}
+    for key, values in grouped.items():
+        uniq: List[str] = []
+        for val in values:
+            if val not in uniq:
+                uniq.append(val)
+        if not uniq:
+            continue
+        if len(uniq) == 1:
+            out[key] = uniq[0]
+        else:
+            out[key] = f"{uniq[0]} | 等{len(uniq)}项"
+    return out
+
+
 def build_poi_risk_indices(
     summary: Dict[str, Any],
     fwd,
-) -> Tuple[List[Any], Optional[STRtree], Dict[int, int], List[Any], Optional[STRtree], Dict[int, int], Dict[str, int]]:
+) -> Tuple[
+    List[Any],
+    Optional[STRtree],
+    Dict[int, int],
+    List[Any],
+    Optional[STRtree],
+    Dict[int, int],
+    Dict[str, int],
+    List[Dict[str, Any]],
+    List[Dict[str, Any]],
+]:
     outputs = summary.get("outputs", {})
     poi_geojson = Path(outputs.get("poi", {}).get("geojson", ""))
     crowd_points_xy: List[Any] = []
     key_points_xy: List[Any] = []
-    counter = {"crowd": 0, "key_facility": 0}
+    crowd_poi_items: List[Dict[str, Any]] = []
+    key_poi_items: List[Dict[str, Any]] = []
+    counter = {"crowd": 0, "sensitive_facility": 0, "key_facility": 0}
     for feat in load_geojson_features(poi_geojson):
         props = feat.get("properties") or {}
         poi_type = str(props.get("poi_type", "")).strip().lower()
         raw_tags = _parse_raw_tags(props.get("raw_tags"))
         if not poi_type:
             candidates = []
-            for k in ("amenity", "office", "shop", "tourism", "leisure"):
+            for k in ("amenity", "office", "shop", "tourism", "leisure", "place", "landuse"):
                 if raw_tags.get(k):
                     candidates.append(f"{k}:{str(raw_tags.get(k)).strip().lower()}")
             if candidates:
                 poi_type = candidates[0]
         is_crowd = poi_type in CROWD_POI_TYPES
         is_key = poi_type in KEY_FACILITY_POI_TYPES
+        if (not is_key) and poi_type.startswith("military:"):
+            is_key = True
         if (not is_crowd) and (not is_key):
             office = str(raw_tags.get("office", "")).strip().lower()
             amenity = str(raw_tags.get("amenity", "")).strip().lower()
+            military = str(raw_tags.get("military", "")).strip().lower()
+            landuse = str(raw_tags.get("landuse", "")).strip().lower()
+            leisure = str(raw_tags.get("leisure", "")).strip().lower()
+            place = str(raw_tags.get("place", "")).strip().lower()
+            shop = str(raw_tags.get("shop", "")).strip().lower()
             if office == "government":
                 is_key = True
-            if amenity in {"hospital", "school", "kindergarten", "bus_station"}:
+            if military or landuse == "military" or amenity == "barracks":
+                is_key = True
+            if amenity in {"hospital", "school", "kindergarten", "bus_station", "college", "university", "square"}:
+                is_crowd = True
+            if leisure in {"park", "garden"}:
+                is_crowd = True
+            if place in {"square"}:
+                is_crowd = True
+            if shop in {"mall", "supermarket"}:
                 is_crowd = True
         if not is_crowd and not is_key:
             continue
@@ -629,11 +787,33 @@ def build_poi_risk_indices(
         pt_xy = _to_xy_geometry(pt_wgs, fwd)
         if pt_xy is None:
             continue
+        poi_name = _poi_name_prefer_zh(props, raw_tags)
+        poi_type_label = _poi_type_label(poi_type)
+        poi_id = str(props.get("id", "")).strip()
         if is_crowd:
             crowd_points_xy.append(pt_xy)
+            crowd_poi_items.append(
+                {
+                    "point_xy": pt_xy,
+                    "name": poi_name,
+                    "type": poi_type_label,
+                    "source": "POI",
+                    "id": poi_id,
+                }
+            )
             counter["crowd"] += 1
         if is_key:
             key_points_xy.append(pt_xy)
+            key_poi_items.append(
+                {
+                    "point_xy": pt_xy,
+                    "name": poi_name,
+                    "type": poi_type_label,
+                    "source": "POI",
+                    "id": poi_id,
+                }
+            )
+            counter["sensitive_facility"] += 1
             counter["key_facility"] += 1
     crowd_tree = STRtree(crowd_points_xy) if crowd_points_xy else None
     key_tree = STRtree(key_points_xy) if key_points_xy else None
@@ -645,6 +825,8 @@ def build_poi_risk_indices(
         key_tree,
         _build_geom_id_map(key_points_xy),
         counter,
+        crowd_poi_items,
+        key_poi_items,
     )
 
 
@@ -652,14 +834,16 @@ def build_line_risk_geometries(
     summary: Dict[str, Any],
     route_bbox: Tuple[float, float, float, float],
     fwd,
-) -> Tuple[List[Any], Any, List[Any], Dict[str, int]]:
+) -> Tuple[List[Any], Any, List[Any], List[Any], Dict[str, int]]:
     outputs = summary.get("outputs", {})
     roads_geojson = Path(outputs.get("transport", {}).get("roads_geojson", ""))
     hsr_geojson = Path(outputs.get("transport", {}).get("hsr_geojson", ""))
     road_lines_xy: List[Any] = []
     hsr_lines_xy: List[Any] = []
+    hv_power_lines_xy: List[Any] = []
     c_road = 0
     c_hsr = 0
+    c_hv_power = 0
     high_road_types = {"motorway", "trunk", "primary"}
     south, north, west, east = route_bbox
     bbox_poly_wgs = Polygon([(west, south), (east, south), (east, north), (west, north), (west, south)])
@@ -698,6 +882,7 @@ def build_line_risk_geometries(
 (
   way({south},{west},{north},{east})[highway~"^(motorway|trunk|primary)$"];
   way({south},{west},{north},{east})[railway=rail][highspeed=yes];
+  way({south},{west},{north},{east})[power~"^(line|minor_line)$"][voltage];
 );
 out geom tags;
 """.strip()
@@ -717,16 +902,30 @@ out geom tags;
         hwy = str(tags.get("highway", "")).strip().lower()
         railway = str(tags.get("railway", "")).strip().lower()
         highspeed = str(tags.get("highspeed", "")).strip().lower()
+        power = str(tags.get("power", "")).strip().lower()
         if hwy in high_road_types:
             road_lines_xy.append(g_xy)
             c_road += 1
         elif railway == "rail" and highspeed in {"yes", "designated"}:
             hsr_lines_xy.append(g_xy)
             c_hsr += 1
+        elif power in {"line", "minor_line"}:
+            voltage_v = _max_voltage_v(tags.get("voltage"))
+            if voltage_v is not None and voltage_v >= HIGH_VOLTAGE_LINE_MIN_V:
+                hv_power_lines_xy.append(g_xy)
+                c_hv_power += 1
 
-    line_risk_geoms = [g.buffer(35.0) for g in road_lines_xy] + [g.buffer(30.0) for g in hsr_lines_xy]
+    line_risk_geoms = (
+        [g.buffer(35.0) for g in road_lines_xy]
+        + [g.buffer(30.0) for g in hsr_lines_xy]
+        + [g.buffer(HIGH_VOLTAGE_LINE_BUFFER_M) for g in hv_power_lines_xy]
+    )
     line_risk_union = unary_union(line_risk_geoms) if line_risk_geoms else None
-    return road_lines_xy, line_risk_union, hsr_lines_xy, {"highway": c_road, "hsr": c_hsr}
+    return road_lines_xy, line_risk_union, hsr_lines_xy, hv_power_lines_xy, {
+        "highway": c_road,
+        "hsr": c_hsr,
+        "high_voltage_power_line": c_hv_power,
+    }
 
 
 class PopulationSampler:
@@ -764,6 +963,46 @@ class PopulationSampler:
         if math.isnan(val) or val < 0:
             return 0.0
         return val
+
+
+def build_population_density_samples(
+    pop_sampler: PopulationSampler,
+    bbox_wgs: Tuple[float, float, float, float],
+    max_points: int = 1200,
+) -> List[Dict[str, float]]:
+    if pop_sampler.data is None or pop_sampler.gt is None or pop_sampler.width <= 0 or pop_sampler.height <= 0:
+        return []
+    south, north, west, east = bbox_wgs
+    gt = pop_sampler.gt
+    px1 = (west - gt[0]) / gt[1]
+    px2 = (east - gt[0]) / gt[1]
+    py1 = (south - gt[3]) / gt[5]
+    py2 = (north - gt[3]) / gt[5]
+    min_px = max(0, int(math.floor(min(px1, px2))))
+    max_px = min(pop_sampler.width - 1, int(math.ceil(max(px1, px2))))
+    min_py = max(0, int(math.floor(min(py1, py2))))
+    max_py = min(pop_sampler.height - 1, int(math.ceil(max(py1, py2))))
+    if min_px > max_px or min_py > max_py:
+        return []
+    span_w = max_px - min_px + 1
+    span_h = max_py - min_py + 1
+    target = max(1, int(max_points))
+    step = max(1, int(math.sqrt((span_w * span_h) / max(1, target))))
+    out: List[Dict[str, float]] = []
+    for py in range(min_py, max_py + 1, step):
+        lat = gt[3] + (py + 0.5) * gt[5]
+        for px in range(min_px, max_px + 1, step):
+            val = float(pop_sampler.data[py][px])
+            if pop_sampler.nodata is not None and val == pop_sampler.nodata:
+                continue
+            if (not math.isfinite(val)) or val <= 0.0:
+                continue
+            lon = gt[0] + (px + 0.5) * gt[1]
+            out.append({"lon": float(lon), "lat": float(lat), "value": float(val)})
+    if len(out) > target:
+        stride = max(1, int(math.ceil(len(out) / target)))
+        out = out[::stride]
+    return out[:target]
 
 
 class TerrainSampler:
@@ -817,6 +1056,42 @@ def _landuse_cost(landuse_type: str) -> float:
 
 def _build_geom_id_map(geoms: List[Any]) -> Dict[int, int]:
     return {id(g): i for i, g in enumerate(geoms)}
+
+
+def _dedupe_point_geometries(points_xy: List[Any], snap_m: float = 8.0) -> List[Any]:
+    out: List[Any] = []
+    seen: set[Tuple[float, float]] = set()
+    for pt in points_xy:
+        if pt is None or getattr(pt, "is_empty", True):
+            continue
+        try:
+            x = float(pt.x)
+            y = float(pt.y)
+        except Exception:
+            continue
+        key = _round_key((x, y), snap_m=snap_m)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(Point(x, y))
+    return out
+
+
+def _buffer_union_from_points(points_xy: List[Any], buffer_m: float) -> Optional[Any]:
+    if buffer_m <= 0.0 or not points_xy:
+        return None
+    geoms: List[Any] = []
+    for pt in points_xy:
+        try:
+            geoms.append(pt.buffer(float(buffer_m)))
+        except Exception:
+            continue
+    if not geoms:
+        return None
+    union_geom = unary_union(geoms)
+    if union_geom is None or union_geom.is_empty:
+        return None
+    return union_geom
 
 
 def _item_to_index(item: Any, geoms: List[Any], geom_id_map: Dict[int, int]) -> Optional[int]:
@@ -958,15 +1233,90 @@ def _is_hard_no_fly(tags: Dict[str, Any]) -> bool:
     return False
 
 
+def load_civil_airport_no_fly_zones(
+    bbox_wgs: Tuple[float, float, float, float],
+    fwd,
+    dataset_geojson_path: str,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    out: List[Any] = []
+    stats: Dict[str, Any] = {
+        "dataset_path": "",
+        "dataset_features_loaded": 0,
+        "dataset_features_intersected": 0,
+        "dataset_airports_intersected": 0,
+    }
+    path = Path(dataset_geojson_path).resolve() if dataset_geojson_path else DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON
+    stats["dataset_path"] = str(path)
+    if not path.exists():
+        return out, stats
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return out, stats
+    features = obj.get("features", []) if isinstance(obj, dict) else []
+    if not isinstance(features, list):
+        return out, stats
+    stats["dataset_features_loaded"] = len(features)
+    south, north, west, east = bbox_wgs
+    bbox_poly_wgs = Polygon([(west, south), (east, south), (east, north), (west, north), (west, south)])
+    by_airport: Dict[str, List[Any]] = defaultdict(list)
+    feature_hits = 0
+    for idx, feat in enumerate(features):
+        if not isinstance(feat, dict):
+            continue
+        geom_obj = feat.get("geometry") or {}
+        props = feat.get("properties") or {}
+        airport_code = str(props.get("icao", "")).strip().upper() or f"feature_{idx + 1}"
+        try:
+            g_wgs = shape(geom_obj)
+        except Exception:
+            continue
+        if g_wgs.is_empty:
+            continue
+        try:
+            if not g_wgs.is_valid:
+                g_wgs = g_wgs.buffer(0)
+        except Exception:
+            continue
+        if g_wgs.is_empty or (not g_wgs.intersects(bbox_poly_wgs)):
+            continue
+        g_xy = _to_xy_geometry(g_wgs, fwd)
+        if g_xy is None:
+            continue
+        if g_xy.geom_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        by_airport[airport_code].append(g_xy)
+        feature_hits += 1
+    for airport_code, geoms in by_airport.items():
+        try:
+            merged = unary_union(geoms)
+        except Exception:
+            continue
+        if merged.is_empty:
+            continue
+        if merged.geom_type in {"Polygon", "MultiPolygon"}:
+            out.append(merged)
+    stats["dataset_features_intersected"] = feature_hits
+    stats["dataset_airports_intersected"] = len(out)
+    return out, stats
+
+
 def fetch_open_data_no_fly_zones(
     bbox_wgs: Tuple[float, float, float, float],
     fwd,
-) -> Tuple[List[Any], List[Any], Dict[str, int]]:
+    civil_airport_geojson: str,
+) -> Tuple[List[Any], List[Any], Dict[str, Any], List[Any], List[Any], List[Any]]:
     south, north, west, east = bbox_wgs
+    civil_hard_polygons_xy, civil_stats = load_civil_airport_no_fly_zones(
+        bbox_wgs,
+        fwd,
+        dataset_geojson_path=civil_airport_geojson,
+    )
+    hard_polygons_xy = list(civil_hard_polygons_xy)
     query = f"""
 [out:json][timeout:120];
 (
-  nwr({south},{west},{north},{east})[aeroway~"^(aerodrome|airport|heliport|helipad)$"];
+  nwr({south},{west},{north},{east})[aeroway~"^(heliport|helipad)$"];
   nwr({south},{west},{north},{east})[military];
 );
 out geom tags;
@@ -974,10 +1324,25 @@ out geom tags;
     try:
         data = run_overpass(query, timeout=120)
     except Exception:
-        return [], [], {"civil_airport": 0, "military_airport": 0, "hard": 0, "soft": 0}
-    hard_polygons_xy: List[Any] = []
+        return hard_polygons_xy, [], {
+            "civil_airport": int(civil_stats.get("dataset_airports_intersected", 0)),
+            "military_airport": 0,
+            "hard": len(hard_polygons_xy),
+            "soft": 0,
+            "civil_source": "xls_dataset",
+            "civil_dataset": civil_stats,
+        }, civil_hard_polygons_xy, [], []
     soft_polygons_xy: List[Any] = []
-    counter = {"civil_airport": 0, "military_airport": 0, "hard": 0, "soft": 0}
+    military_hard_polygons_xy: List[Any] = []
+    heli_soft_polygons_xy: List[Any] = []
+    counter: Dict[str, Any] = {
+        "civil_airport": int(civil_stats.get("dataset_airports_intersected", 0)),
+        "military_airport": 0,
+        "hard": len(hard_polygons_xy),
+        "soft": 0,
+        "civil_source": "xls_dataset",
+        "civil_dataset": civil_stats,
+    }
     max_zone_area_m2 = 180_000_000.0
     max_span_m = 80_000.0
     for el in data.get("elements", []):
@@ -988,10 +1353,7 @@ out geom tags;
         g_xy = _to_xy_geometry(g_wgs, fwd)
         if g_xy is None:
             continue
-        aeroway = str(tags.get("aeroway", "")).strip().lower()
         military = str(tags.get("military", "")).strip().lower()
-        if aeroway in {"aerodrome", "airport"}:
-            counter["civil_airport"] += 1
         if military in {"airfield", "air_base", "airbase", "naval_air_station"}:
             counter["military_airport"] += 1
         try:
@@ -1010,19 +1372,24 @@ out geom tags;
                 continue
             if is_hard:
                 hard_polygons_xy.append(zone)
+                military_hard_polygons_xy.append(zone)
                 counter["hard"] += 1
             else:
                 soft_polygons_xy.append(zone)
+                aeroway = str(tags.get("aeroway", "")).strip().lower()
+                if aeroway in {"heliport", "helipad"}:
+                    heli_soft_polygons_xy.append(zone)
                 counter["soft"] += 1
         except Exception:
             continue
-    return hard_polygons_xy, soft_polygons_xy, counter
+    counter["heli_soft"] = len(heli_soft_polygons_xy)
+    return hard_polygons_xy, soft_polygons_xy, counter, civil_hard_polygons_xy, military_hard_polygons_xy, heli_soft_polygons_xy
 
 
 def fetch_school_kindergarten_zones(
     bbox_wgs: Tuple[float, float, float, float],
     fwd,
-) -> Tuple[List[Any], List[Any], Dict[str, int]]:
+) -> Tuple[List[Any], List[Any], Dict[str, int], List[Dict[str, Any]]]:
     south, north, west, east = bbox_wgs
     query = f"""
 [out:json][timeout:120];
@@ -1034,9 +1401,10 @@ out geom tags;
     try:
         data = run_overpass(query, timeout=120)
     except Exception:
-        return [], [], {"school": 0, "kindergarten": 0}
+        return [], [], {"school": 0, "kindergarten": 0}, []
     hard_zones_xy: List[Any] = []
     points_xy: List[Any] = []
+    school_poi_items: List[Dict[str, Any]] = []
     counter = {"school": 0, "kindergarten": 0}
     for el in data.get("elements", []):
         tags = el.get("tags") or {}
@@ -1054,17 +1422,26 @@ out geom tags;
         try:
             if g_xy.geom_type == "Point":
                 zone = g_xy.buffer(SCHOOL_HARD_BUFFER_M)
-                points_xy.append(g_xy)
+                pt = g_xy
             elif g_xy.geom_type in {"Polygon", "MultiPolygon"}:
                 zone = g_xy.buffer(18.0)
-                points_xy.append(g_xy.representative_point())
+                pt = g_xy.representative_point()
             else:
                 zone = g_xy.buffer(26.0)
-                points_xy.append(g_xy.representative_point())
+                pt = g_xy.representative_point()
+            points_xy.append(pt)
             hard_zones_xy.append(zone)
+            school_poi_items.append(
+                {
+                    "point_xy": pt,
+                    "name": _poi_name_prefer_zh({}, tags),
+                    "type": "学校" if amenity == "school" else "幼儿园",
+                    "source": "学校避让",
+                }
+            )
         except Exception:
             continue
-    return hard_zones_xy, points_xy, counter
+    return hard_zones_xy, points_xy, counter, school_poi_items
 
 
 def fetch_osm_buildings_and_obstacles(
@@ -1673,7 +2050,8 @@ def build_navigation_graph(
     crowd_points_xy: List[Any],
     crowd_tree: Optional[STRtree],
     crowd_id_map: Dict[int, int],
-    crowd_hard_union_xy,
+    school_hard_union_xy,
+    sensitive_hard_union_xy,
     school_penalty_air: float,
     school_penalty_ground: float,
     key_points_xy: List[Any],
@@ -1691,14 +2069,20 @@ def build_navigation_graph(
     nofly_hard = no_fly_hard_union_xy if no_fly_hard_union_xy is not None and (not no_fly_hard_union_xy.is_empty) else None
     nofly_soft = no_fly_soft_union_xy if no_fly_soft_union_xy is not None and (not no_fly_soft_union_xy.is_empty) else None
     infra_hard = infra_hard_union_xy if infra_hard_union_xy is not None and (not infra_hard_union_xy.is_empty) else None
-    crowd_hard = crowd_hard_union_xy if crowd_hard_union_xy is not None and (not crowd_hard_union_xy.is_empty) else None
+    school_hard = school_hard_union_xy if school_hard_union_xy is not None and (not school_hard_union_xy.is_empty) else None
+    sensitive_hard = (
+        sensitive_hard_union_xy
+        if sensitive_hard_union_xy is not None and (not sensitive_hard_union_xy.is_empty)
+        else None
+    )
     line_risk_union = line_risk_union_xy if line_risk_union_xy is not None and (not line_risk_union_xy.is_empty) else None
     high_building_union = (
         high_building_union_xy if high_building_union_xy is not None and (not high_building_union_xy.is_empty) else None
     )
     skipped_nofly = 0
     skipped_infra_hard = 0
-    skipped_crowd_hard = 0
+    skipped_school_hard = 0
+    skipped_sensitive_hard = 0
     kept_edges = 0
     air_edges = 0
     min_base_per_m = float("inf")
@@ -1759,7 +2143,7 @@ def build_navigation_graph(
         soft_overlap = _segment_overlap_ratio(seg, nofly_soft)
         line_overlap = _segment_overlap_ratio(seg, line_risk_union)
         high_build_overlap = _segment_overlap_ratio(seg, high_building_union)
-        school_overlap = _segment_overlap_ratio(seg, crowd_hard)
+        school_overlap = _segment_overlap_ratio(seg, school_hard)
         crowd_pen = 0.5 * (sum(crowd_samples) / max(1, len(crowd_samples))) + 0.5 * _percentile(crowd_samples, 0.8)
         key_pen = 0.45 * (sum(key_samples) / max(1, len(key_samples))) + 0.55 * _percentile(key_samples, 0.8)
         water_like_ratio = (
@@ -1805,7 +2189,6 @@ def build_navigation_graph(
             + weights["crowd"] * crowd_pen
             + weights["key_facility"] * key_pen
             + weights["line_cross"] * line_overlap
-            + weights["high_building"] * high_build_overlap
             + (school_penalty_air if ntype == "air" else school_penalty_ground) * school_overlap
         ) * network_mult * context_mult
         base_cost = dist * max(0.01, per_m)
@@ -1830,7 +2213,7 @@ def build_navigation_graph(
         }
 
     def try_add_edge(a: Tuple[float, float], b: Tuple[float, float], ntype: str) -> bool:
-        nonlocal kept_edges, skipped_nofly, skipped_infra_hard, skipped_crowd_hard, air_edges, min_base_per_m
+        nonlocal kept_edges, skipped_nofly, skipped_infra_hard, skipped_school_hard, skipped_sensitive_hard, air_edges, min_base_per_m
         if a == b:
             return False
         edge_key = (a, b, ntype) if a <= b else (b, a, ntype)
@@ -1845,8 +2228,11 @@ def build_navigation_graph(
         if infra_hard is not None and seg.intersects(infra_hard):
             skipped_infra_hard += 1
             return False
-        if crowd_hard is not None and seg.intersects(crowd_hard):
-            skipped_crowd_hard += 1
+        if school_hard is not None and seg.intersects(school_hard):
+            skipped_school_hard += 1
+            return False
+        if sensitive_hard is not None and seg.intersects(sensitive_hard):
+            skipped_sensitive_hard += 1
             return False
         meta = edge_meta_for_segment(seg, ntype=ntype)
         dist_m = max(1e-6, float(meta.get("dist", 1.0)))
@@ -1946,7 +2332,9 @@ def build_navigation_graph(
             "air_edges": air_edges,
             "skipped_nofly": skipped_nofly,
             "skipped_infra_hard": skipped_infra_hard,
-            "skipped_crowd_hard": skipped_crowd_hard,
+            "skipped_school_hard": skipped_school_hard,
+            "skipped_sensitive_hard": skipped_sensitive_hard,
+            "skipped_crowd_hard": skipped_school_hard + skipped_sensitive_hard,
             "min_base_per_m": round(min_base_per_m, 6) if math.isfinite(min_base_per_m) else 1.0,
         }
 
@@ -2009,7 +2397,9 @@ def build_navigation_graph(
         "air_edges": air_edges,
         "skipped_nofly": skipped_nofly,
         "skipped_infra_hard": skipped_infra_hard,
-        "skipped_crowd_hard": skipped_crowd_hard,
+        "skipped_school_hard": skipped_school_hard,
+        "skipped_sensitive_hard": skipped_sensitive_hard,
+        "skipped_crowd_hard": skipped_school_hard + skipped_sensitive_hard,
         "min_base_per_m": round(min_base_per_m, 6) if math.isfinite(min_base_per_m) else 1.0,
     }
 
@@ -2912,6 +3302,28 @@ def _downsample_profile_samples(samples: List[Dict[str, float]], max_points: int
     return out
 
 
+def build_dynamic_grb_geometry(route_line_xy: LineString, profile_samples: List[Dict[str, float]]) -> Optional[Any]:
+    if route_line_xy is None or route_line_xy.is_empty or not profile_samples:
+        return None
+    geoms: List[Any] = []
+    samples = _downsample_profile_samples(profile_samples, max_points=420)
+    route_len = max(1e-6, float(route_line_xy.length))
+    for sample in samples:
+        dist_m = max(0.0, min(route_len, _safe_float(sample.get("distance_m", 0.0), 0.0)))
+        agl_m = max(1.0, _safe_float(sample.get("true_height_m", 0.0), 0.0))
+        try:
+            p = route_line_xy.interpolate(dist_m)
+            geoms.append(p.buffer(agl_m))
+        except Exception:
+            continue
+    if not geoms:
+        return None
+    dyn = unary_union(geoms)
+    if dyn is None or dyn.is_empty:
+        return None
+    return dyn
+
+
 def _svg_path(
     samples: List[Dict[str, float]],
     field: str,
@@ -2933,11 +3345,13 @@ def _svg_path(
     return " ".join(pts)
 
 
-def _build_profile_panel_html(name: str, profile_samples: List[Dict[str, float]]) -> str:
-    samples = _downsample_profile_samples(profile_samples, max_points=260)
-    if len(samples) < 2:
+def _build_profile_panel_html(
+    name: str,
+    profile_variants: Dict[str, Dict[str, Any]],
+    default_profile_variant_id: str,
+) -> str:
+    if not profile_variants:
         return ""
-
     width = 1100.0
     height = 280.0
     left = 64.0
@@ -2947,68 +3361,98 @@ def _build_profile_panel_html(name: str, profile_samples: List[Dict[str, float]]
     plot_w = width - left - right
     plot_h = height - top - bottom
 
-    dist_max = max(1.0, float(samples[-1].get("distance_m", 0.0)))
-    vals = []
-    for s in samples:
-        vals.append(float(s.get("route_alt_msl_m", 0.0)))
-        vals.append(float(s.get("surface_msl_m", 0.0)))
-        vals.append(float(s.get("terrain_msl_m", 0.0)))
-    h_lo = min(vals)
-    h_hi = max(vals)
-    span = max(1.0, h_hi - h_lo)
-    h_min = max(0.0, h_lo - span * 0.08)
-    h_max = h_hi + span * 0.08
+    variants_html: List[str] = []
+    options_html: List[str] = []
+    variant_ids = list(profile_variants.keys())
+    default_id = str(default_profile_variant_id or "")
+    if default_id not in variant_ids:
+        default_id = variant_ids[0]
+    for vid in variant_ids:
+        item = profile_variants.get(vid) or {}
+        samples = _downsample_profile_samples(item.get("samples") or [], max_points=260)
+        if len(samples) < 2:
+            continue
+        label = str(item.get("label", vid))
+        dist_max = max(1.0, float(samples[-1].get("distance_m", 0.0)))
+        vals = []
+        for s in samples:
+            vals.append(float(s.get("route_alt_msl_m", 0.0)))
+            vals.append(float(s.get("surface_msl_m", 0.0)))
+            vals.append(float(s.get("terrain_msl_m", 0.0)))
+        h_lo = min(vals)
+        h_hi = max(vals)
+        span = max(1.0, h_hi - h_lo)
+        h_min = max(0.0, h_lo - span * 0.08)
+        h_max = h_hi + span * 0.08
 
-    y_ticks = 5
-    grid_parts = []
-    label_parts = []
-    for i in range(y_ticks + 1):
-        y = top + (plot_h * i / y_ticks)
-        v = h_max - (h_max - h_min) * i / y_ticks
-        grid_parts.append(
-            f'<line x1="{left:.1f}" y1="{y:.2f}" x2="{left + plot_w:.1f}" y2="{y:.2f}" stroke="#e0e0e0" stroke-width="1"/>'
-        )
-        label_parts.append(
-            f'<text x="{left - 8:.1f}" y="{y + 4:.2f}" text-anchor="end" fill="#616161" font-size="11">{v:.0f}</text>'
-        )
+        y_ticks = 5
+        grid_parts = []
+        label_parts = []
+        for i in range(y_ticks + 1):
+            y = top + (plot_h * i / y_ticks)
+            v = h_max - (h_max - h_min) * i / y_ticks
+            grid_parts.append(
+                f'<line x1="{left:.1f}" y1="{y:.2f}" x2="{left + plot_w:.1f}" y2="{y:.2f}" stroke="#e0e0e0" stroke-width="1"/>'
+            )
+            label_parts.append(
+                f'<text x="{left - 8:.1f}" y="{y + 4:.2f}" text-anchor="end" fill="#616161" font-size="11">{v:.0f}</text>'
+            )
 
-    x_ticks = 6
-    for i in range(x_ticks + 1):
-        x = left + (plot_w * i / x_ticks)
-        km = (dist_max * i / x_ticks) / 1000.0
-        grid_parts.append(
-            f'<line x1="{x:.2f}" y1="{top:.1f}" x2="{x:.2f}" y2="{top + plot_h:.1f}" stroke="#eeeeee" stroke-width="1"/>'
-        )
-        label_parts.append(
-            f'<text x="{x:.2f}" y="{top + plot_h + 18:.1f}" text-anchor="middle" fill="#616161" font-size="11">{km:.2f} km</text>'
-        )
+        x_ticks = 6
+        for i in range(x_ticks + 1):
+            x = left + (plot_w * i / x_ticks)
+            km = (dist_max * i / x_ticks) / 1000.0
+            grid_parts.append(
+                f'<line x1="{x:.2f}" y1="{top:.1f}" x2="{x:.2f}" y2="{top + plot_h:.1f}" stroke="#eeeeee" stroke-width="1"/>'
+            )
+            label_parts.append(
+                f'<text x="{x:.2f}" y="{top + plot_h + 18:.1f}" text-anchor="middle" fill="#616161" font-size="11">{km:.2f} km</text>'
+            )
 
-    terrain_path = _svg_path(samples, "terrain_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
-    surface_path = _svg_path(samples, "surface_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
-    route_path = _svg_path(samples, "route_alt_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
-    true_vals = [float(s.get("true_height_m", 0.0)) for s in samples]
-    min_true = min(true_vals) if true_vals else 0.0
-    mean_true = (sum(true_vals) / len(true_vals)) if true_vals else 0.0
-
+        terrain_path = _svg_path(samples, "terrain_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
+        surface_path = _svg_path(samples, "surface_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
+        route_path = _svg_path(samples, "route_alt_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
+        true_vals = [float(s.get("true_height_m", 0.0)) for s in samples]
+        min_true = min(true_vals) if true_vals else 0.0
+        mean_true = (sum(true_vals) / len(true_vals)) if true_vals else 0.0
+        selected = " selected" if vid == default_id else ""
+        hidden_cls = "" if vid == default_id else " is-hidden"
+        options_html.append(f'<option value="{html.escape(vid)}"{selected}>{html.escape(label)}</option>')
+        variants_html.append(
+            f"""
+    <div class="route-profile-panel__variant{hidden_cls}" data-role="profile-variant" data-profile-id="{html.escape(vid)}">
+      <div class="route-profile-panel__meta">
+        {html.escape(name)} | {html.escape(label)} | 距离 {dist_max/1000.0:.2f} km | 真高最小/均值 {min_true:.1f}/{mean_true:.1f} m
+      </div>
+      <svg viewBox="0 0 {width:.0f} {height:.0f}" class="route-profile-panel__chart">
+        {''.join(grid_parts)}
+        <polyline fill="none" stroke="#94a9b8" stroke-width="2" points="{terrain_path}"/>
+        <polyline fill="none" stroke="#8d6e63" stroke-width="2.5" points="{surface_path}"/>
+        <polyline fill="none" stroke="#1e5ea8" stroke-width="2.8" points="{route_path}"/>
+        {''.join(label_parts)}
+      </svg>
+    </div>
+"""
+        )
+    if not variants_html:
+        return ""
     panel = f"""
 <div class="route-profile-panel">
   <div class="route-profile-panel__head">
     <div>
       <div class="route-profile-panel__title">航线垂直剖面</div>
-      <div class="route-profile-panel__meta">
-        {html.escape(name)} | 距离 {dist_max/1000.0:.2f} km | 真高最小/均值 {min_true:.1f}/{mean_true:.1f} m
+      <div class="route-profile-panel__head-controls">
+        <label>剖面航线
+          <select data-role="profile-variant-select">
+            {''.join(options_html)}
+          </select>
+        </label>
       </div>
     </div>
     <button type="button" class="route-profile-panel__toggle" data-role="profile-toggle">收起剖面</button>
   </div>
   <div class="route-profile-panel__body">
-    <svg viewBox="0 0 {width:.0f} {height:.0f}" class="route-profile-panel__chart">
-      {''.join(grid_parts)}
-      <polyline fill="none" stroke="#94a9b8" stroke-width="2" points="{terrain_path}"/>
-      <polyline fill="none" stroke="#8d6e63" stroke-width="2.5" points="{surface_path}"/>
-      <polyline fill="none" stroke="#1e5ea8" stroke-width="2.8" points="{route_path}"/>
-      {''.join(label_parts)}
-    </svg>
+    {''.join(variants_html)}
     <div class="route-profile-panel__legend">
       <span><span class="route-profile-panel__line route-profile-panel__line--route"></span>航线高度（MSL）</span>
       <span><span class="route-profile-panel__line route-profile-panel__line--surface"></span>地表顶面（地形+建筑/障碍物）</span>
@@ -3076,6 +3520,10 @@ def _build_preview_theme_head_html() -> str:
     min-width: 260px;
   }
 
+  .leaflet-control-layers.route-native-hidden {
+    display: none !important;
+  }
+
   .leaflet-control-layers-expanded {
     padding: 10px 12px;
   }
@@ -3098,7 +3546,7 @@ def _build_preview_theme_head_html() -> str:
     position: absolute;
     top: 14px;
     left: 14px;
-    z-index: 1100;
+    z-index: 1160;
     width: min(336px, calc(100vw - 28px));
     border: 1px solid var(--panel-border);
     border-radius: 16px;
@@ -3135,6 +3583,26 @@ def _build_preview_theme_head_html() -> str:
     margin-bottom: 6px;
   }
 
+  .route-map-toolbar__label-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+  }
+
+  .route-map-toolbar__collapse {
+    border: 1px solid #c5d6e7;
+    background: #f2f7fe;
+    color: #325375;
+    border-radius: 999px;
+    padding: 3px 9px;
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    cursor: pointer;
+  }
+
   .route-map-toolbar__chips {
     display: flex;
     flex-wrap: wrap;
@@ -3150,7 +3618,7 @@ def _build_preview_theme_head_html() -> str:
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
-    transition: all 0.16s ease;
+    transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease, box-shadow 0.16s ease, transform 0.16s ease;
   }
 
   .route-chip.is-active {
@@ -3175,6 +3643,10 @@ def _build_preview_theme_head_html() -> str:
     color: #66819a;
     letter-spacing: 0.06em;
     text-transform: uppercase;
+  }
+
+  .route-map-toolbar.is-layers-collapsed .route-map-toolbar__layers {
+    display: none;
   }
 
   .route-toggle {
@@ -3205,6 +3677,284 @@ def _build_preview_theme_head_html() -> str:
     gap: 8px;
   }
 
+  .route-editor-panel {
+    position: absolute;
+    top: 74px;
+    left: 14px;
+    bottom: 220px;
+    z-index: 1140;
+    width: min(350px, calc(100vw - 28px));
+    border: 1px solid var(--panel-border);
+    border-radius: 16px;
+    background: var(--panel-bg);
+    box-shadow: var(--panel-shadow);
+    backdrop-filter: blur(10px);
+    color: var(--text-main);
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    max-height: min(62vh, calc(100vh - 300px));
+    overscroll-behavior: contain;
+  }
+
+  .route-editor-panel__head {
+    padding: 10px 12px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    border-bottom: 1px solid #d9e6f3;
+    background: linear-gradient(180deg, #fbfdff 0%, #f2f8ff 100%);
+  }
+
+  .route-editor-panel__head-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .route-editor-panel__title {
+    font-size: 15px;
+    line-height: 1.2;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+  }
+
+  .route-editor-panel__head button {
+    border: 1px solid #c2d5e8;
+    background: #f5f9ff;
+    color: #274465;
+    border-radius: 10px;
+    padding: 5px 10px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .route-editor-panel__body {
+    padding: 11px 12px 12px;
+    display: grid;
+    gap: 9px;
+    overflow: auto;
+    overscroll-behavior: contain;
+  }
+
+  .route-editor-panel__row {
+    display: grid;
+    gap: 8px;
+  }
+
+  .route-editor-panel__hint {
+    font-size: 12px;
+    line-height: 1.45;
+    color: #4a6886;
+    background: #f3f8ff;
+    border: 1px solid #d9e7f4;
+    border-radius: 10px;
+    padding: 7px 9px;
+  }
+
+  .route-editor-panel__row--inline {
+    display: grid;
+    grid-template-columns: 1fr auto auto;
+    gap: 7px;
+    align-items: center;
+  }
+
+  .route-editor-panel__row--pair {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .route-editor-panel__advanced-wrap {
+    display: grid;
+    gap: 8px;
+    background: #f7fbff;
+    border: 1px solid #dce9f5;
+    border-radius: 10px;
+    padding: 8px;
+  }
+
+  .route-editor-panel__advanced-wrap.is-collapsed {
+    display: none;
+  }
+
+  .route-editor-panel__text {
+    font-size: 12px;
+    color: #4b6986;
+    line-height: 1.45;
+  }
+
+  .route-editor-panel__field-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+
+  .route-editor-panel label {
+    display: grid;
+    gap: 4px;
+    font-size: 12px;
+    color: #355474;
+    font-weight: 600;
+  }
+
+  .route-editor-panel input {
+    width: 100%;
+    border: 1px solid #c8d9ea;
+    border-radius: 10px;
+    background: #fbfdff;
+    color: #18314d;
+    padding: 7px 9px;
+    font-size: 13px;
+    line-height: 1.2;
+  }
+
+  .route-editor-panel select {
+    width: 100%;
+    border: 1px solid #c8d9ea;
+    border-radius: 10px;
+    background: #fbfdff;
+    color: #18314d;
+    padding: 7px 9px;
+    font-size: 13px;
+    line-height: 1.2;
+  }
+
+  .route-editor-panel__alt-nudges {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 7px;
+  }
+
+  .route-editor-panel__alt-nudges button {
+    border: 1px solid #bcd0e5;
+    background: #f5faff;
+    color: #20405f;
+    border-radius: 10px;
+    padding: 7px 8px;
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+
+  .route-editor-panel__actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px;
+  }
+
+  .route-editor-panel__history {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 7px;
+  }
+
+  .route-editor-panel__actions button,
+  .route-editor-panel__history button,
+  .route-editor-panel__primary {
+    border: 1px solid #b7cde2;
+    background: #f4f9ff;
+    color: #1f3d5c;
+    border-radius: 10px;
+    padding: 7px 9px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: rgba(30, 94, 168, 0.14);
+  }
+
+  .route-editor-panel__actions button:disabled,
+  .route-editor-panel__history button:disabled,
+  .route-editor-panel__primary:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+  }
+
+  .route-editor-panel__primary {
+    background: #1f62ad;
+    color: #ffffff;
+    border-color: #1f62ad;
+  }
+
+  .route-editor-panel__status {
+    min-height: 18px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: #496784;
+  }
+
+  .route-editor-panel.is-collapsed .route-editor-panel__body {
+    display: none;
+  }
+
+  .route-waypoint-marker {
+    width: 28px;
+    height: 28px;
+    margin-left: -14px;
+    margin-top: -14px;
+    border-radius: 999px;
+    display: grid;
+    place-items: center;
+    background: #ffffff;
+    border: 2px solid #1f5fa8;
+    color: #1f5fa8;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    box-shadow: 0 2px 10px rgba(24, 64, 109, 0.24), 0 0 0 2px rgba(255, 255, 255, 0.84);
+    transition: transform 0.12s ease, border-color 0.12s ease, color 0.12s ease;
+    cursor: grab;
+    touch-action: none;
+  }
+
+  .route-waypoint-marker.is-dirty {
+    border-color: #cb7a1f;
+    color: #cb7a1f;
+    background: #fff8ec;
+  }
+
+  .route-waypoint-marker.is-active {
+    background: #fffbf1;
+    border-color: #d26c10;
+    color: #ad5200;
+    transform: scale(1.14);
+    box-shadow: 0 0 0 3px rgba(255, 228, 194, 0.95), 0 6px 12px rgba(173, 82, 0, 0.22);
+    cursor: grabbing;
+  }
+
+  .route-midpoint-handle {
+    width: 18px;
+    height: 18px;
+    margin-left: -9px;
+    margin-top: -9px;
+    border-radius: 999px;
+    display: grid;
+    place-items: center;
+    background: #f3f8ff;
+    border: 1.5px dashed #5583b3;
+    color: #3d6b99;
+    font-size: 12px;
+    font-weight: 700;
+    line-height: 1;
+    box-shadow: 0 2px 8px rgba(53, 94, 138, 0.22);
+  }
+
+  .route-midpoint-handle.is-active {
+    background: #fff3df;
+    border-style: solid;
+    border-color: #cb7a1f;
+    color: #cb7a1f;
+  }
+
+  body.route-dragging,
+  body.route-dragging * {
+    user-select: none !important;
+  }
+
   .route-map-toolbar__actions button {
     border: 1px solid #b8cde2;
     background: #f4f9ff;
@@ -3214,7 +3964,17 @@ def _build_preview_theme_head_html() -> str:
     font-size: 13px;
     font-weight: 600;
     cursor: pointer;
-    transition: all 0.16s ease;
+    transition: background-color 0.16s ease, border-color 0.16s ease, color 0.16s ease;
+    touch-action: manipulation;
+    -webkit-tap-highlight-color: rgba(30, 94, 168, 0.14);
+  }
+
+  .route-editor-panel button:focus-visible,
+  .route-editor-panel input:focus-visible,
+  .route-editor-panel select:focus-visible,
+  .route-profile-panel button:focus-visible {
+    outline: 2px solid #1e5ea8;
+    outline-offset: 2px;
   }
 
   .route-map-toolbar__actions button:hover {
@@ -3252,11 +4012,37 @@ def _build_preview_theme_head_html() -> str:
     line-height: 1.2;
   }
 
+  .route-profile-panel__head-controls {
+    margin-top: 5px;
+  }
+
+  .route-profile-panel__head-controls label {
+    display: inline-grid;
+    gap: 4px;
+    font-size: 12px;
+    color: #355474;
+    font-weight: 600;
+  }
+
+  .route-profile-panel__head-controls select {
+    border: 1px solid #c8d9ea;
+    border-radius: 10px;
+    background: #fbfdff;
+    color: #18314d;
+    padding: 6px 9px;
+    font-size: 13px;
+    line-height: 1.2;
+  }
+
   .route-profile-panel__meta {
     margin-top: 3px;
     font-size: 13px;
     color: var(--text-sub);
     line-height: 1.45;
+  }
+
+  .route-profile-panel__variant.is-hidden {
+    display: none;
   }
 
   .route-profile-panel__toggle {
@@ -3321,16 +4107,21 @@ def _build_preview_theme_head_html() -> str:
     .route-map-toolbar {
       width: min(92vw, 332px);
     }
+
+    .route-editor-panel {
+      width: min(92vw, 336px);
+      max-height: min(58vh, calc(100vh - 280px));
+    }
   }
 
   @media (max-width: 768px) {
     .route-map-toolbar {
-      top: auto;
-      bottom: 172px;
+      top: 10px;
+      bottom: auto;
       left: 10px;
-      right: 10px;
-      width: auto;
-      max-height: 44vh;
+      right: auto;
+      width: min(80vw, 312px);
+      max-height: 38vh;
       overflow: auto;
     }
 
@@ -3339,6 +4130,16 @@ def _build_preview_theme_head_html() -> str:
       right: 8px;
       bottom: 8px;
       padding: 10px;
+    }
+
+    .route-editor-panel {
+      top: auto;
+      left: 10px;
+      right: 10px;
+      bottom: 112px;
+      width: auto;
+      max-height: 46vh;
+      overflow: auto;
     }
 
     .route-profile-panel__title {
@@ -3353,10 +4154,21 @@ def _build_preview_theme_head_html() -> str:
 """
 
 
-def _build_preview_toolbar_script_html() -> str:
-    return """
+def _build_preview_toolbar_script_html(
+    name: str,
+    route_variants: Dict[str, Dict[str, Any]],
+    default_route_variant_id: str,
+) -> str:
+    route_variants_json = json.dumps(route_variants, ensure_ascii=False)
+    default_variant_json = json.dumps(str(default_route_variant_id or "safety_default"), ensure_ascii=False)
+    route_name_json = json.dumps(str(name), ensure_ascii=False)
+    template = """
 <script>
 (function () {
+  const routeEditorVariants = __ROUTE_VARIANTS_JSON__;
+  const routeEditorDefaultId = __ROUTE_DEFAULT_ID_JSON__;
+  const routeEditorName = __ROUTE_NAME_JSON__;
+
   function hasAny(text, keywords) {
     const source = String(text || "");
     return keywords.some(function (k) {
@@ -3365,26 +4177,203 @@ def _build_preview_toolbar_script_html() -> str:
   }
 
   function groupName(layerName) {
-    if (hasAny(layerName, ["候选航线", "Candidate:", "主航线", "Route (3D"])) return "航线方案";
-    if (hasAny(layerName, ["禁飞", "No-fly", "缓冲", "Buffer", "起点", "Start/End"])) return "安全边界";
-    if (hasAny(layerName, ["高层", "High Buildings", "学校", "School", "人群", "Crowd", "关键", "Line Risks", "低风险"])) return "风险参考";
+    if (hasAny(layerName, ["候选航线", "Candidate:", "主航线", "Route (3D", "安全优先", "效率优先"])) return "航线方案";
+    if (hasAny(layerName, ["禁飞", "No-fly", "缓冲", "Buffer", "GRB", "起点", "Start/End"])) return "安全边界";
+    if (hasAny(layerName, ["高层", "High Buildings", "建筑", "学校", "School", "人群", "Crowd", "敏感设施", "关键基础设施", "Line Risks", "低风险", "人口密度", "土地利用"])) return "风险参考";
     return "其他";
+  }
+
+  function clampNumber(value, minVal, maxVal) {
+    const v = Number(value);
+    const lo = Number(minVal);
+    const hi = Number(maxVal);
+    if (!Number.isFinite(v)) return lo;
+    if (!Number.isFinite(lo)) return v;
+    if (!Number.isFinite(hi)) return Math.max(v, lo);
+    return Math.min(Math.max(v, lo), hi);
+  }
+
+  function isElementVisible(el) {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    if (!style) return false;
+    return style.display !== "none" && style.visibility !== "hidden" && Number(style.opacity || "1") > 0;
+  }
+
+  function rectsIntersect(a, b) {
+    if (!a || !b) return false;
+    return a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
+  }
+
+  function triggerPanelLayout() {
+    if (typeof window.__routeSchedulePanelLayout === "function") {
+      window.__routeSchedulePanelLayout();
+    }
+  }
+
+  function setupPanelLayout(map) {
+    if (!map || map._routePanelLayoutReady) return;
+    const container = map.getContainer();
+    if (!container) return;
+
+    function applyLayout() {
+      const editor = container.querySelector(".route-editor-panel");
+      if (!editor) return;
+      const containerRect = container.getBoundingClientRect();
+      if (!containerRect || containerRect.height <= 0) return;
+
+      const mobile = window.matchMedia("(max-width: 768px)").matches;
+      const gap = mobile ? 8 : 10;
+      const minHeight = mobile ? 140 : 120;
+      const defaultBottom = mobile ? 112 : 220;
+      const editorCollapsed = editor.classList.contains("is-collapsed");
+      const nativeLayers = container.querySelector(".leaflet-control-layers");
+      if (nativeLayers) {
+        nativeLayers.classList.remove("route-native-hidden");
+      }
+      let bottomPx = defaultBottom;
+      const profile = document.querySelector(".route-profile-panel");
+      if (profile) {
+        if (mobile || profile.classList.contains("is-collapsed")) {
+          profile.style.left = "";
+          profile.style.right = "";
+          profile.style.maxWidth = "";
+          profile.style.margin = "";
+        } else {
+          let leftInset = 12;
+          let rightInset = 12;
+          if (isElementVisible(editor)) {
+            const editorRect = editor.getBoundingClientRect();
+            leftInset = Math.max(leftInset, Math.ceil(editorRect.right + gap));
+          }
+          if (isElementVisible(nativeLayers)) {
+            const nativeRect = nativeLayers.getBoundingClientRect();
+            rightInset = Math.max(rightInset, Math.ceil(window.innerWidth - nativeRect.left + gap));
+          }
+          const minProfileWidth = 420;
+          const availWidth = window.innerWidth - leftInset - rightInset;
+          if (availWidth < minProfileWidth) {
+            leftInset = 12;
+            rightInset = 12;
+          }
+          profile.style.left = leftInset + "px";
+          profile.style.right = rightInset + "px";
+          profile.style.maxWidth = "none";
+          profile.style.margin = "0";
+        }
+      }
+      if (isElementVisible(profile)) {
+        const profileRect = profile.getBoundingClientRect();
+        const overlap = containerRect.bottom - profileRect.top;
+        if (Number.isFinite(overlap) && overlap > 0) {
+          bottomPx = Math.max(bottomPx, Math.ceil(overlap + gap));
+        }
+      }
+
+      if (editorCollapsed) {
+        if (mobile) {
+          editor.style.left = "";
+          editor.style.right = "";
+          editor.style.top = "10px";
+        } else {
+          editor.style.left = "14px";
+          editor.style.right = "auto";
+          editor.style.top = "74px";
+        }
+        editor.style.bottom = "auto";
+        editor.style.maxHeight = "none";
+        editor.style.overflow = "hidden";
+        return;
+      }
+      editor.style.overflow = "auto";
+
+      if (mobile) {
+        const bottomMin = 8;
+        const bottomMax = Math.max(bottomMin, containerRect.height - minHeight - 8);
+        bottomPx = clampNumber(bottomPx, bottomMin, bottomMax);
+        const available = Math.max(minHeight, Math.floor(containerRect.height - bottomPx - 16));
+        editor.style.left = "";
+        editor.style.right = "";
+        editor.style.top = "auto";
+        editor.style.bottom = bottomPx + "px";
+        editor.style.maxHeight = available + "px";
+        return;
+      }
+
+      const topPx = 74;
+
+      const topMin = 14;
+      const bottomMin = 16;
+      const topMax = Math.max(topMin, containerRect.height - bottomPx - minHeight);
+      const finalTopPx = clampNumber(topPx, topMin, topMax);
+      const bottomMax = Math.max(bottomMin, containerRect.height - finalTopPx - minHeight);
+      bottomPx = clampNumber(bottomPx, bottomMin, bottomMax);
+      const available = Math.max(minHeight, Math.floor(containerRect.height - finalTopPx - bottomPx));
+
+      editor.style.left = "14px";
+      editor.style.right = "auto";
+      editor.style.top = finalTopPx + "px";
+      editor.style.bottom = bottomPx + "px";
+      editor.style.maxHeight = available + "px";
+    }
+
+    function scheduleLayout() {
+      if (map._routePanelLayoutRaf) return;
+      map._routePanelLayoutRaf = window.requestAnimationFrame(function () {
+        map._routePanelLayoutRaf = 0;
+        applyLayout();
+      });
+    }
+
+    map._routeSchedulePanelLayout = scheduleLayout;
+    window.__routeSchedulePanelLayout = scheduleLayout;
+    window.addEventListener("resize", scheduleLayout);
+    window.addEventListener("orientationchange", scheduleLayout);
+    map.on("resize", scheduleLayout);
+    map._routePanelLayoutReady = true;
+    scheduleLayout();
   }
 
   function setupProfilePanel() {
     const panel = document.querySelector(".route-profile-panel");
     if (!panel || panel.dataset.ready === "1") return;
     const toggle = panel.querySelector('[data-role="profile-toggle"]');
+    const variantSelect = panel.querySelector('[data-role="profile-variant-select"]');
+    const variants = Array.from(panel.querySelectorAll('[data-role="profile-variant"]'));
+    function switchProfileVariant(profileId) {
+      const targetId = String(profileId || "");
+      variants.forEach(function (node) {
+        const nid = String(node && node.getAttribute("data-profile-id") || "");
+        node.classList.toggle("is-hidden", nid !== targetId);
+      });
+      triggerPanelLayout();
+    }
     if (!toggle) return;
+    if (variantSelect && variants.length) {
+      const initId = String(variantSelect.value || (variants[0] && variants[0].getAttribute("data-profile-id")) || "");
+      switchProfileVariant(initId);
+      variantSelect.addEventListener("change", function () {
+        switchProfileVariant(variantSelect.value);
+      });
+    }
+    panel.classList.add("is-collapsed");
+    toggle.textContent = "展开剖面";
     toggle.addEventListener("click", function () {
       const collapsed = panel.classList.toggle("is-collapsed");
       toggle.textContent = collapsed ? "展开剖面" : "收起剖面";
+      triggerPanelLayout();
     });
     panel.dataset.ready = "1";
   }
 
   function setOverlayVisible(map, entry, visible) {
-    if (!entry || !entry.layer) return;
+    if (!entry) return;
+    if (entry.input) {
+      const next = !!visible;
+      if (!!entry.input.checked !== next) entry.input.click();
+      return;
+    }
+    if (!entry.layer) return;
     if (visible) {
       if (!map.hasLayer(entry.layer)) map.addLayer(entry.layer);
     } else {
@@ -3392,21 +4381,95 @@ def _build_preview_toolbar_script_html() -> str:
     }
   }
 
+  function normalizeLayerName(name) {
+    return String(name || "").replace(/\\s+/g, " ").trim();
+  }
+
+  function readNativeLayerEntries() {
+    const root = document.querySelector(".leaflet-control-layers");
+    if (!root) return { base: [], overlays: [] };
+    function collect(selector, overlay) {
+      return Array.from(root.querySelectorAll(selector + " label"))
+        .map(function (label) {
+          const input = label.querySelector("input.leaflet-control-layers-selector");
+          if (!input) return null;
+          const name = normalizeLayerName(label.textContent);
+          return {
+            name: name || (overlay ? "图层" : "底图"),
+            layer: null,
+            overlay: !!overlay,
+            input: input,
+          };
+        })
+        .filter(Boolean);
+    }
+    return {
+      base: collect(".leaflet-control-layers-base", false),
+      overlays: collect(".leaflet-control-layers-overlays", true),
+    };
+  }
+
+  function mergeEntriesWithNative(entries, nativeEntries) {
+    const output = Array.isArray(entries) ? entries.slice() : [];
+    const normalized = new Map();
+    output.forEach(function (entry, idx) {
+      normalized.set(normalizeLayerName(entry && entry.name), { entry: entry, idx: idx });
+    });
+    (Array.isArray(nativeEntries) ? nativeEntries : []).forEach(function (nativeEntry) {
+      const key = normalizeLayerName(nativeEntry && nativeEntry.name);
+      const existing = normalized.get(key);
+      if (existing && existing.entry) {
+        existing.entry.input = nativeEntry.input || existing.entry.input;
+        if (!existing.entry.layer && nativeEntry.layer) existing.entry.layer = nativeEntry.layer;
+      } else {
+        output.push(nativeEntry);
+      }
+    });
+    return output;
+  }
+
+  function findLayerCatalog() {
+    const keys = Object.keys(window).filter(function (key) {
+      return /^layer_control_.*_layers$/.test(key);
+    });
+    for (let i = keys.length - 1; i >= 0; i -= 1) {
+      const value = window[keys[i]];
+      if (value && value.base_layers && value.overlays) return value;
+    }
+    return null;
+  }
+
+  function hideNativeLayerControl() {
+    const el = document.querySelector(".leaflet-control-layers");
+    if (el) el.classList.add("route-native-hidden");
+  }
+
   function setupToolbar(map) {
     if (!map || map._routeToolbarReady) return true;
-    const control = map._controlLayers;
-    if (!control || !control._layers) return false;
-    const entries = Object.values(control._layers);
-    if (!entries.length) return false;
+    const catalog = findLayerCatalog();
+    const nativeEntries = readNativeLayerEntries();
+    if (!catalog && !nativeEntries.base.length) return false;
 
     const container = map.getContainer();
     if (!container || container.querySelector(".route-map-toolbar")) return true;
 
-    const baseEntries = entries.filter(function (entry) {
-      return !entry.overlay;
-    });
-    const overlayEntries = entries.filter(function (entry) {
-      return !!entry.overlay;
+    let baseEntries = catalog
+      ? Object.entries(catalog.base_layers || {}).map(function (entry) {
+          return { name: String(entry[0] || "底图"), layer: entry[1], overlay: false };
+        })
+      : [];
+    let overlayEntries = catalog
+      ? Object.entries(catalog.overlays || {}).map(function (entry) {
+          return { name: String(entry[0] || "图层"), layer: entry[1], overlay: true };
+        })
+      : [];
+    baseEntries = mergeEntriesWithNative(baseEntries, nativeEntries.base);
+    overlayEntries = mergeEntriesWithNative(overlayEntries, nativeEntries.overlays);
+    const dynamicOverlays = Array.isArray(map._routeDynamicOverlays) ? map._routeDynamicOverlays : [];
+    dynamicOverlays.forEach(function (item) {
+      if (item && item.layer) {
+        overlayEntries.push({ name: String(item.name || "动态图层"), layer: item.layer, overlay: true });
+      }
     });
     if (!baseEntries.length) return false;
 
@@ -3420,7 +4483,10 @@ def _build_preview_toolbar_script_html() -> str:
       '<div class="route-map-toolbar__chips" data-role="base"></div>' +
       '</div>' +
       '<div class="route-map-toolbar__block">' +
+      '<div class="route-map-toolbar__label-row">' +
       '<div class="route-map-toolbar__label">图层</div>' +
+      '<button type="button" class="route-map-toolbar__collapse" data-role="layers-toggle">收起</button>' +
+      '</div>' +
       '<div class="route-map-toolbar__layers" data-role="layers"></div>' +
       '</div>' +
       '<div class="route-map-toolbar__actions">' +
@@ -3438,6 +4504,15 @@ def _build_preview_toolbar_script_html() -> str:
     });
 
     function applyBase(target) {
+      if (target && target.input) {
+        if (!target.input.checked) target.input.click();
+        if (satLabels) {
+          const useSat = !!target && hasAny(target.name, ["卫星"]);
+          setOverlayVisible(map, satLabels, useSat);
+        }
+        syncState();
+        return;
+      }
       baseEntries.forEach(function (entry) {
         if (entry.layer && map.hasLayer(entry.layer)) {
           map.removeLayer(entry.layer);
@@ -3453,11 +4528,13 @@ def _build_preview_toolbar_script_html() -> str:
 
     function syncState() {
       baseButtons.forEach(function (item) {
-        const active = !!item.entry.layer && map.hasLayer(item.entry.layer);
+        const active = item.entry.input ? !!item.entry.input.checked : !!item.entry.layer && map.hasLayer(item.entry.layer);
         item.button.classList.toggle("is-active", active);
       });
       overlayInputs.forEach(function (item) {
-        item.input.checked = !!item.entry.layer && map.hasLayer(item.entry.layer);
+        item.input.checked = item.entry.input
+          ? !!item.entry.input.checked
+          : !!item.entry.layer && map.hasLayer(item.entry.layer);
       });
     }
 
@@ -3469,6 +4546,11 @@ def _build_preview_toolbar_script_html() -> str:
       button.addEventListener("click", function () {
         applyBase(entry);
       });
+      if (entry.input) {
+        entry.input.addEventListener("change", function () {
+          syncState();
+        });
+      }
       baseWrap.appendChild(button);
       baseButtons.push({ entry: entry, button: button });
     });
@@ -3483,40 +4565,54 @@ def _build_preview_toolbar_script_html() -> str:
       return a.label.localeCompare(b.label, "zh-Hans-CN");
     });
 
-    let currentGroup = "";
-    grouped.forEach(function (item) {
-      if (item.group !== currentGroup) {
-        currentGroup = item.group;
-        const heading = document.createElement("div");
-        heading.className = "route-map-toolbar__group";
-        heading.textContent = currentGroup;
-        layerWrap.appendChild(heading);
-      }
-      const row = document.createElement("label");
-      row.className = "route-toggle";
-      const input = document.createElement("input");
-      input.type = "checkbox";
-      input.checked = !!item.entry.layer && map.hasLayer(item.entry.layer);
-      input.addEventListener("change", function () {
-        setOverlayVisible(map, item.entry, input.checked);
+    if (!grouped.length) {
+      const empty = document.createElement("div");
+      empty.className = "route-editor-panel__text";
+      empty.textContent = "未读取到可切换图层，请刷新页面后重试。";
+      layerWrap.appendChild(empty);
+    } else {
+      let currentGroup = "";
+      grouped.forEach(function (item) {
+        if (item.group !== currentGroup) {
+          currentGroup = item.group;
+          const heading = document.createElement("div");
+          heading.className = "route-map-toolbar__group";
+          heading.textContent = currentGroup;
+          layerWrap.appendChild(heading);
+        }
+        const row = document.createElement("label");
+        row.className = "route-toggle";
+        const input = document.createElement("input");
+        input.type = "checkbox";
+        input.checked = item.entry.input
+          ? !!item.entry.input.checked
+          : !!item.entry.layer && map.hasLayer(item.entry.layer);
+        input.addEventListener("change", function () {
+          setOverlayVisible(map, item.entry, input.checked);
+        });
+        if (item.entry.input) {
+          item.entry.input.addEventListener("change", function () {
+            syncState();
+          });
+        }
+        const text = document.createElement("span");
+        text.textContent = item.label;
+        row.appendChild(input);
+        row.appendChild(text);
+        layerWrap.appendChild(row);
+        overlayInputs.push({ entry: item.entry, input: input });
       });
-      const text = document.createElement("span");
-      text.textContent = item.label;
-      row.appendChild(input);
-      row.appendChild(text);
-      layerWrap.appendChild(row);
-      overlayInputs.push({ entry: item.entry, input: input });
-    });
+    }
 
     function applyPreset(mode) {
       overlayEntries.forEach(function (entry) {
         if (satLabels && entry === satLabels) return;
-        const name = String(entry.name || "");
+        const lname = String(entry.name || "");
         let visible = false;
         if (mode === "clear") {
-          visible = hasAny(name, ["主航线", "Route (3D", "起点/终点", "Start/End", "禁飞", "No-fly", "缓冲", "Buffer", "候选航线：2", "Candidate: 2"]);
+          visible = hasAny(lname, ["主航线", "Route (3D", "起点/终点", "Start/End", "禁飞", "No-fly", "缓冲", "Buffer", "GRB", "安全优先", "效率优先"]);
         } else if (mode === "risk") {
-          visible = hasAny(name, ["主航线", "Route (3D", "起点/终点", "Start/End", "禁飞", "No-fly", "高层", "High Buildings", "学校", "School", "人群", "Crowd", "关键设施", "Key Facility", "关键基础设施", "Critical Infrastructure", "线性风险", "Line Risks"]);
+          visible = hasAny(lname, ["主航线", "Route (3D", "起点/终点", "Start/End", "禁飞", "No-fly", "高层", "High Buildings", "建筑", "学校", "School", "人群", "Crowd", "敏感设施", "Sensitive Facility", "关键基础设施", "Critical Infrastructure", "线性风险", "Line Risks"]);
         }
         setOverlayVisible(map, entry, visible);
       });
@@ -3525,6 +4621,7 @@ def _build_preview_toolbar_script_html() -> str:
 
     const presetClear = toolbar.querySelector('[data-role="preset-clear"]');
     const presetRisk = toolbar.querySelector('[data-role="preset-risk"]');
+    const layersToggle = toolbar.querySelector('[data-role="layers-toggle"]');
     if (presetClear) {
       presetClear.addEventListener("click", function () {
         applyPreset("clear");
@@ -3535,10 +4632,864 @@ def _build_preview_toolbar_script_html() -> str:
         applyPreset("risk");
       });
     }
-
+    if (layersToggle) {
+      layersToggle.addEventListener("click", function () {
+        const collapsed = toolbar.classList.toggle("is-layers-collapsed");
+        layersToggle.textContent = collapsed ? "展开" : "收起";
+        triggerPanelLayout();
+      });
+    }
     map.on("layeradd layerremove baselayerchange", syncState);
     map._routeToolbarReady = true;
     syncState();
+    triggerPanelLayout();
+    return true;
+  }
+
+  function setupRouteEditor(map) {
+    if (!map || map._routeEditorReady) return true;
+    const variantsObj = routeEditorVariants && typeof routeEditorVariants === "object" ? routeEditorVariants : {};
+    const variantIds = Object.keys(variantsObj).filter(function (rid) {
+      const item = variantsObj[rid] || {};
+      return Array.isArray(item.points) && item.points.length >= 2;
+    });
+    if (!variantIds.length) {
+      map._routeEditorReady = true;
+      return true;
+    }
+    const defaultRouteId = variantIds.indexOf(routeEditorDefaultId) >= 0 ? routeEditorDefaultId : variantIds[0];
+    const activeSeed = variantsObj[defaultRouteId].points;
+    const container = map.getContainer();
+    if (!container) return false;
+
+    const panel = document.createElement("div");
+    panel.className = "route-editor-panel";
+    panel.innerHTML =
+      '<div class="route-editor-panel__head">' +
+      '<div class="route-editor-panel__title">航点编辑器</div>' +
+      '<div class="route-editor-panel__head-actions">' +
+      '<button type="button" data-role="editor-panel-toggle">收起</button>' +
+      "</div>" +
+      '</div>' +
+      '<div class="route-editor-panel__body">' +
+      '<div class="route-editor-panel__row">' +
+      '<label>编辑基线航线<select name="route_base" data-role="route-base-select"></select></label>' +
+      "</div>" +
+      '<div class="route-editor-panel__row">' +
+      '<button type="button" class="route-editor-panel__primary" data-role="edit-mode-toggle">开启拖拽编辑</button>' +
+      '<div class="route-editor-panel__text" data-role="summary">航点 0 / 0</div>' +
+      "</div>" +
+      '<div class="route-editor-panel__hint" data-role="edit-hint">开启后可拖动航点；点击蓝色航线可直接插入新航点，航线实时跟随。</div>' +
+      '<div class="route-editor-panel__history">' +
+      '<button type="button" data-role="undo-change">撤销上一步</button>' +
+      '<button type="button" data-role="redo-change">重做</button>' +
+      "</div>" +
+      '<div class="route-editor-panel__row">' +
+      '<label>快速选择航点<select name="point_select" data-role="point-select"></select></label>' +
+      "</div>" +
+      '<div class="route-editor-panel__row route-editor-panel__row--inline">' +
+      '<input type="number" min="1" step="1" name="point_index" autocomplete="off" inputmode="numeric" data-role="point-index" />' +
+      '<button type="button" data-role="point-prev">上一点</button>' +
+      '<button type="button" data-role="point-next">下一点</button>' +
+      "</div>" +
+      '<div class="route-editor-panel__row route-editor-panel__row--pair">' +
+      '<button type="button" data-role="advanced-toggle">展开高级调整</button>' +
+      '<div class="route-editor-panel__text">经纬度与高度数值微调</div>' +
+      "</div>" +
+      '<div class="route-editor-panel__advanced-wrap is-collapsed" data-role="advanced-wrap">' +
+      '<div class="route-editor-panel__field-grid">' +
+      '<label>经度<input type="number" step="0.000001" name="point_lon" autocomplete="off" inputmode="decimal" data-role="point-lon" /></label>' +
+      '<label>纬度<input type="number" step="0.000001" name="point_lat" autocomplete="off" inputmode="decimal" data-role="point-lat" /></label>' +
+      '<label style="grid-column: 1 / span 2;">高度(m)<input type="number" step="0.1" name="point_alt" autocomplete="off" inputmode="decimal" data-role="point-alt" /></label>' +
+      "</div>" +
+      '<div class="route-editor-panel__alt-nudges">' +
+      '<button type="button" data-role="alt-minus-5">高度 -5m</button>' +
+      '<button type="button" data-role="alt-plus-5">高度 +5m</button>' +
+      '<button type="button" data-role="alt-plus-20">高度 +20m</button>' +
+      "</div>" +
+      "</div>" +
+      '<div class="route-editor-panel__actions">' +
+      '<button type="button" data-role="restore-point">还原本点(初始)</button>' +
+      '<button type="button" data-role="restore-all">还原全部航点</button>' +
+      '<button type="button" data-role="locate-point">定位本点</button>' +
+      "</div>" +
+      '<div class="route-editor-panel__row">' +
+      '<label>KML文件名<input type="text" name="kml_name" autocomplete="off" data-role="kml-name" /></label>' +
+      '<button type="button" class="route-editor-panel__primary" data-role="save-kml">另存为新KML</button>' +
+      "</div>" +
+      '<div class="route-editor-panel__status" data-role="editor-status" aria-live="polite"></div>' +
+      "</div>";
+    container.appendChild(panel);
+    ["click", "dblclick", "mousedown", "mouseup", "touchstart", "touchend", "pointerdown"].forEach(function (evt) {
+      panel.addEventListener(evt, function (e) {
+        e.stopPropagation();
+      });
+    });
+    panel.addEventListener(
+      "wheel",
+      function (e) {
+        e.stopPropagation();
+      },
+      { passive: true }
+    );
+
+    const state = {
+      routeVariants: variantsObj,
+      activeRouteId: defaultRouteId,
+      points: activeSeed.map(function (p, idx) {
+        return { lon: Number(p.lon), lat: Number(p.lat), alt: Number(p.alt), originIdx: idx };
+      }),
+      original: activeSeed.map(function (p, idx) {
+        return { lon: Number(p.lon), lat: Number(p.lat), alt: Number(p.alt), originIdx: idx };
+      }),
+      selectedIndex: 0,
+      editEnabled: false,
+      markersReady: false,
+      markers: [],
+      updateScheduled: false,
+      undoStack: [],
+      redoStack: [],
+      maxHistory: 60,
+      draggingIndex: -1,
+      routeLayers: {},
+      routeLayerWasVisible: {},
+    };
+
+    const catalog = findLayerCatalog();
+    if (catalog && catalog.overlays) {
+      Object.entries(catalog.overlays).forEach(function (entry) {
+        const layerName = String(entry[0] || "");
+        const layer = entry[1];
+        if (!layer) return;
+        if (hasAny(layerName, ["安全优先（3D高度）"])) {
+          state.routeLayers.safety_default = layer;
+          state.routeLayerWasVisible.safety_default = map.hasLayer(layer);
+        } else if (hasAny(layerName, ["效率优先（3D高度）"])) {
+          state.routeLayers.efficiency = layer;
+          state.routeLayerWasVisible.efficiency = map.hasLayer(layer);
+        }
+      });
+    }
+
+    const editLayer = L.featureGroup();
+    const markerLayer = L.layerGroup();
+    const editLine = L.polyline([], {
+      color: "#0f62ad",
+      weight: 4,
+      opacity: 0.92,
+      dashArray: "9 7",
+    }).addTo(editLayer);
+    editLayer.addTo(map);
+    if (!Array.isArray(map._routeDynamicOverlays)) {
+      map._routeDynamicOverlays = [];
+    }
+    map._routeDynamicOverlays = map._routeDynamicOverlays.filter(function (item) {
+      return !(item && item.name === "手动编辑结果");
+    });
+    map._routeDynamicOverlays.push({ name: "手动编辑结果", layer: editLayer });
+
+    const ui = {
+      panel: panel,
+      panelToggle: panel.querySelector('[data-role="editor-panel-toggle"]'),
+      routeBaseSelect: panel.querySelector('[data-role="route-base-select"]'),
+      editToggle: panel.querySelector('[data-role="edit-mode-toggle"]'),
+      summary: panel.querySelector('[data-role="summary"]'),
+      hint: panel.querySelector('[data-role="edit-hint"]'),
+      undoChange: panel.querySelector('[data-role="undo-change"]'),
+      redoChange: panel.querySelector('[data-role="redo-change"]'),
+      pointSelect: panel.querySelector('[data-role="point-select"]'),
+      index: panel.querySelector('[data-role="point-index"]'),
+      prev: panel.querySelector('[data-role="point-prev"]'),
+      next: panel.querySelector('[data-role="point-next"]'),
+      advancedToggle: panel.querySelector('[data-role="advanced-toggle"]'),
+      advancedWrap: panel.querySelector('[data-role="advanced-wrap"]'),
+      lon: panel.querySelector('[data-role="point-lon"]'),
+      lat: panel.querySelector('[data-role="point-lat"]'),
+      alt: panel.querySelector('[data-role="point-alt"]'),
+      altMinus5: panel.querySelector('[data-role="alt-minus-5"]'),
+      altPlus5: panel.querySelector('[data-role="alt-plus-5"]'),
+      altPlus20: panel.querySelector('[data-role="alt-plus-20"]'),
+      restorePoint: panel.querySelector('[data-role="restore-point"]'),
+      restoreAll: panel.querySelector('[data-role="restore-all"]'),
+      locate: panel.querySelector('[data-role="locate-point"]'),
+      kmlName: panel.querySelector('[data-role="kml-name"]'),
+      saveKml: panel.querySelector('[data-role="save-kml"]'),
+      status: panel.querySelector('[data-role="editor-status"]'),
+    };
+
+    const defaultKmlName = String(routeEditorName || "edited_route")
+      .trim()
+      .replace(/\\s+/g, "_")
+      .replace(/[\\\\/:*?"<>|]/g, "_");
+    if (ui.kmlName) ui.kmlName.value = (defaultKmlName || "edited_route") + "_manual.kml";
+
+    function setPanelCollapsed(collapsed) {
+      const next = !!collapsed;
+      panel.classList.toggle("is-collapsed", next);
+      if (ui.panelToggle) ui.panelToggle.textContent = next ? "展开" : "收起";
+      triggerPanelLayout();
+    }
+
+    function setAdvancedCollapsed(collapsed) {
+      if (!ui.advancedWrap || !ui.advancedToggle) return;
+      const next = !!collapsed;
+      ui.advancedWrap.classList.toggle("is-collapsed", next);
+      ui.advancedToggle.textContent = next ? "展开高级调整" : "收起高级调整";
+    }
+
+    setAdvancedCollapsed(true);
+    if (window.matchMedia("(max-width: 768px)").matches) {
+      setPanelCollapsed(true);
+    } else {
+      setPanelCollapsed(false);
+    }
+
+    function clonePoint(p) {
+      const originIdx = p && Number.isInteger(p.originIdx) ? Number(p.originIdx) : null;
+      return { lon: Number(p.lon), lat: Number(p.lat), alt: Number(p.alt), originIdx: originIdx };
+    }
+
+    function updateRouteBaseOptions() {
+      if (!ui.routeBaseSelect) return;
+      ui.routeBaseSelect.innerHTML = "";
+      variantIds.forEach(function (rid) {
+        const item = state.routeVariants[rid] || {};
+        const option = document.createElement("option");
+        option.value = String(rid);
+        option.textContent = String(item.label || rid);
+        ui.routeBaseSelect.appendChild(option);
+      });
+      ui.routeBaseSelect.value = String(state.activeRouteId || defaultRouteId);
+    }
+
+    function pointsEqual(a, b) {
+      if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+      for (let i = 0; i < a.length; i += 1) {
+        const p1 = a[i];
+        const p2 = b[i];
+        if (
+          !p1 ||
+          !p2 ||
+          Math.abs(Number(p1.lon) - Number(p2.lon)) > 1e-9 ||
+          Math.abs(Number(p1.lat) - Number(p2.lat)) > 1e-9 ||
+          Math.abs(Number(p1.alt) - Number(p2.alt)) > 1e-9 ||
+          Number(p1.originIdx ?? -1) !== Number(p2.originIdx ?? -1)
+        ) {
+          return false;
+        }
+      }
+      return true;
+    }
+
+    function snapshotPoints() {
+      return state.points.map(function (p) {
+        return clonePoint(p);
+      });
+    }
+
+    function pointChanged(index) {
+      const cur = state.points[index];
+      if (!cur) return false;
+      const originIdx = Number.isInteger(cur.originIdx) ? Number(cur.originIdx) : -1;
+      if (originIdx < 0 || originIdx >= state.original.length) return true;
+      const ori = state.original[originIdx];
+      if (!ori) return true;
+      return (
+        Math.abs(cur.lon - ori.lon) > 1e-9 ||
+        Math.abs(cur.lat - ori.lat) > 1e-9 ||
+        Math.abs(cur.alt - ori.alt) > 1e-9
+      );
+    }
+
+    function updateHistoryButtons() {
+      if (ui.undoChange) ui.undoChange.disabled = state.undoStack.length === 0;
+      if (ui.redoChange) ui.redoChange.disabled = state.redoStack.length === 0;
+    }
+
+    function pushHistory() {
+      const snap = snapshotPoints();
+      const prev = state.undoStack[state.undoStack.length - 1];
+      if (prev && pointsEqual(prev, snap)) return;
+      state.undoStack.push(snap);
+      if (state.undoStack.length > state.maxHistory) {
+        state.undoStack.shift();
+      }
+      state.redoStack = [];
+      updateHistoryButtons();
+    }
+
+    function applySnapshot(snapshot) {
+      if (!Array.isArray(snapshot) || !snapshot.length) return;
+      state.points = snapshot.map(function (p) {
+        return clonePoint(p);
+      });
+      state.selectedIndex = Math.max(0, Math.min(state.points.length - 1, state.selectedIndex));
+      rebuildEditableLayers();
+      scheduleLineRefresh();
+      refreshSelectedFields();
+    }
+
+    function switchRouteBase(routeId) {
+      const rid = String(routeId || "");
+      if (variantIds.indexOf(rid) < 0) return;
+      if (rid === state.activeRouteId) return;
+      const seed = state.routeVariants[rid] && Array.isArray(state.routeVariants[rid].points)
+        ? state.routeVariants[rid].points
+        : null;
+      if (!seed || seed.length < 2) return;
+      state.activeRouteId = rid;
+      state.points = seed.map(function (p, idx) {
+        return { lon: Number(p.lon), lat: Number(p.lat), alt: Number(p.alt), originIdx: idx };
+      });
+      state.original = seed.map(function (p, idx) {
+        return { lon: Number(p.lon), lat: Number(p.lat), alt: Number(p.alt), originIdx: idx };
+      });
+      state.selectedIndex = 0;
+      state.undoStack = [];
+      state.redoStack = [];
+      rebuildEditableLayers();
+      scheduleLineRefresh();
+      refreshSelectedFields();
+      updateHistoryButtons();
+      updateRouteBaseOptions();
+      state.routeLayerWasVisible[rid] = !!(state.routeLayers[rid] && map.hasLayer(state.routeLayers[rid]));
+      updateStatus("已切换编辑基线: " + String((state.routeVariants[rid] || {}).label || rid));
+    }
+
+    function markerIcon(index, active) {
+      const changed = pointChanged(index);
+      let cls = "route-waypoint-marker";
+      if (changed) cls += " is-dirty";
+      if (active) cls += " is-active";
+      return L.divIcon({
+        className: cls,
+        html: String(index + 1),
+        iconSize: [28, 28],
+        iconAnchor: [14, 14],
+      });
+    }
+
+    function changedCount() {
+      let count = 0;
+      const seenOriginal = new Set();
+      state.points.forEach(function (p) {
+        const originIdx = Number.isInteger(p.originIdx) ? Number(p.originIdx) : -1;
+        if (originIdx < 0 || originIdx >= state.original.length) {
+          count += 1;
+          return;
+        }
+        seenOriginal.add(originIdx);
+        const b = state.original[originIdx];
+        if (!b) {
+          count += 1;
+          return;
+        }
+        if (
+          Math.abs(p.lon - b.lon) > 1e-9 ||
+          Math.abs(p.lat - b.lat) > 1e-9 ||
+          Math.abs(p.alt - b.alt) > 1e-9
+        ) {
+          count += 1;
+        }
+      });
+      for (let i = 0; i < state.original.length; i += 1) {
+        if (!seenOriginal.has(i)) count += 1;
+      }
+      return count;
+    }
+
+    function updateStatus(text) {
+      if (ui.status) ui.status.textContent = String(text || "");
+    }
+
+    function refreshPointSelectOptions() {
+      if (!ui.pointSelect) return;
+      ui.pointSelect.innerHTML = "";
+      state.points.forEach(function (p, idx) {
+        const option = document.createElement("option");
+        option.value = String(idx);
+        const isInserted = !Number.isInteger(p.originIdx);
+        option.textContent =
+          "航点 " +
+          (idx + 1) +
+          (isInserted ? " (新增)" : "") +
+          " | " +
+          p.lat.toFixed(4) +
+          ", " +
+          p.lon.toFixed(4) +
+          " | " +
+          p.alt.toFixed(1) +
+          "m";
+        ui.pointSelect.appendChild(option);
+      });
+      ui.pointSelect.value = String(state.selectedIndex);
+    }
+
+    function syncLine() {
+      const latlngs = state.points.map(function (p) {
+        return [p.lat, p.lon];
+      });
+      editLine.setLatLngs(latlngs);
+    }
+
+    function scheduleLineRefresh() {
+      if (state.updateScheduled) return;
+      state.updateScheduled = true;
+      window.requestAnimationFrame(function () {
+        state.updateScheduled = false;
+        syncLine();
+        refreshSummary();
+      });
+    }
+
+    function refreshMarkerStyles() {
+      if (!state.markersReady) return;
+      state.markers.forEach(function (mk, idx) {
+        mk.setIcon(markerIcon(idx, idx === state.selectedIndex));
+      });
+    }
+
+    function ensureMarkers() {
+      if (state.markersReady) return;
+      state.markers = state.points.map(function (p, idx) {
+        const marker = L.marker([p.lat, p.lon], {
+          draggable: true,
+          icon: markerIcon(idx, false),
+          keyboard: false,
+          autoPan: true,
+        });
+        marker.on("dragstart", function () {
+          state.draggingIndex = idx;
+          document.body.classList.add("route-dragging");
+          pushHistory();
+        });
+        marker.on("drag", function () {
+          const ll = marker.getLatLng();
+          state.points[idx].lon = ll.lng;
+          state.points[idx].lat = ll.lat;
+          if (idx === state.selectedIndex) {
+            refreshSelectedFields();
+          }
+          scheduleLineRefresh();
+        });
+        marker.on("dragend", function () {
+          const ll = marker.getLatLng();
+          state.points[idx].lon = ll.lng;
+          state.points[idx].lat = ll.lat;
+          state.draggingIndex = -1;
+          document.body.classList.remove("route-dragging");
+          selectPoint(idx, false);
+          updateStatus("已拖动航点 " + (idx + 1) + "，航线已实时更新");
+        });
+        marker.on("click", function () {
+          selectPoint(idx, false);
+        });
+        marker.bindTooltip("航点 " + (idx + 1), { direction: "top", offset: [0, -6] });
+        marker.addTo(markerLayer);
+        return marker;
+      });
+      state.markersReady = true;
+      refreshMarkerStyles();
+    }
+
+    function nearestSegmentInfo(targetLatLng) {
+      if (!targetLatLng || state.points.length < 2) {
+        return { index: 0, distPx: Infinity };
+      }
+      const tp = map.latLngToLayerPoint(targetLatLng);
+      let bestIdx = 0;
+      let bestDistSq = Infinity;
+      for (let i = 0; i < state.points.length - 1; i += 1) {
+        const a = map.latLngToLayerPoint([state.points[i].lat, state.points[i].lon]);
+        const b = map.latLngToLayerPoint([state.points[i + 1].lat, state.points[i + 1].lon]);
+        const abx = b.x - a.x;
+        const aby = b.y - a.y;
+        const lenSq = abx * abx + aby * aby;
+        let t = 0.0;
+        if (lenSq > 1e-9) {
+          t = ((tp.x - a.x) * abx + (tp.y - a.y) * aby) / lenSq;
+          t = Math.max(0.0, Math.min(1.0, t));
+        }
+        const px = a.x + t * abx;
+        const py = a.y + t * aby;
+        const dx = tp.x - px;
+        const dy = tp.y - py;
+        const distSq = dx * dx + dy * dy;
+        if (distSq < bestDistSq) {
+          bestDistSq = distSq;
+          bestIdx = i;
+        }
+      }
+      return { index: bestIdx, distPx: Math.sqrt(bestDistSq) };
+    }
+
+    function insertWaypointAtSegment(segIdx, ll, reasonText) {
+      const safeSeg = Math.max(0, Math.min(state.points.length - 2, Number(segIdx) || 0));
+      const left = state.points[safeSeg];
+      const right = state.points[safeSeg + 1];
+      const insertAlt = left && right ? (Number(left.alt) + Number(right.alt)) * 0.5 : 60.0;
+      const insertIdx = safeSeg + 1;
+      state.points.splice(insertIdx, 0, { lon: ll.lng, lat: ll.lat, alt: insertAlt, originIdx: null });
+      rebuildEditableLayers();
+      scheduleLineRefresh();
+      selectPoint(insertIdx, false);
+      updateStatus("已" + String(reasonText || "插入") + "新航点 " + (insertIdx + 1));
+    }
+
+    function rebuildEditableLayers() {
+      markerLayer.clearLayers();
+      state.markers = [];
+      state.markersReady = false;
+      ensureMarkers();
+      if (state.editEnabled) {
+        if (!map.hasLayer(markerLayer)) map.addLayer(markerLayer);
+      }
+    }
+
+    map.on("click", function (event) {
+      if (!state.editEnabled || !event || !event.latlng) return;
+      if (state.draggingIndex >= 0) return;
+      const targetEl = event.originalEvent && event.originalEvent.target;
+      if (targetEl && typeof targetEl.closest === "function" && targetEl.closest(".route-waypoint-marker")) {
+        return;
+      }
+      const nearest = nearestSegmentInfo(event.latlng);
+      if (!nearest || !Number.isFinite(nearest.distPx) || nearest.distPx > 18) return;
+      pushHistory();
+      insertWaypointAtSegment(nearest.index, event.latlng, "点击航线新增");
+    });
+
+    function refreshSummary() {
+      if (!ui.summary) return;
+      const changed = changedCount();
+      ui.summary.textContent =
+        "航点 " +
+        (state.selectedIndex + 1) +
+        " / " +
+        state.points.length +
+        " | 已修改 " +
+        changed +
+        " 个";
+    }
+
+    function refreshSelectedFields() {
+      const point = state.points[state.selectedIndex];
+      if (!point) return;
+      if (ui.index) ui.index.value = String(state.selectedIndex + 1);
+      if (ui.lon) ui.lon.value = point.lon.toFixed(6);
+      if (ui.lat) ui.lat.value = point.lat.toFixed(6);
+      if (ui.alt) ui.alt.value = point.alt.toFixed(1);
+      refreshPointSelectOptions();
+      refreshSummary();
+      refreshMarkerStyles();
+    }
+
+    function selectPoint(index, panToPoint) {
+      const idx = Math.max(0, Math.min(state.points.length - 1, Number(index) || 0));
+      state.selectedIndex = idx;
+      refreshSelectedFields();
+      if (panToPoint) {
+        const p = state.points[idx];
+        map.panTo([p.lat, p.lon], { animate: true, duration: 0.35 });
+      }
+    }
+
+    function syncMarkerPosition(index) {
+      if (!state.markersReady) return;
+      const marker = state.markers[index];
+      const point = state.points[index];
+      if (marker && point) marker.setLatLng([point.lat, point.lon]);
+    }
+
+    function applyCurrentPointFromInputs() {
+      const idx = state.selectedIndex;
+      const point = state.points[idx];
+      if (!point) return;
+      const lon = Number(ui.lon && ui.lon.value);
+      const lat = Number(ui.lat && ui.lat.value);
+      const alt = Number(ui.alt && ui.alt.value);
+      if (!Number.isFinite(lon) || !Number.isFinite(lat) || !Number.isFinite(alt)) {
+        updateStatus("经纬度或高度格式无效，请输入数值");
+        return;
+      }
+      const unchanged =
+        Math.abs(point.lon - lon) < 1e-9 &&
+        Math.abs(point.lat - lat) < 1e-9 &&
+        Math.abs(point.alt - alt) < 1e-9;
+      if (unchanged) return;
+      pushHistory();
+      point.lon = lon;
+      point.lat = lat;
+      point.alt = alt;
+      syncMarkerPosition(idx);
+      scheduleLineRefresh();
+      refreshSelectedFields();
+      updateStatus("已应用航点 " + (idx + 1) + " 的经纬度和高度");
+    }
+
+    function nudgeCurrentAltitude(delta) {
+      const idx = state.selectedIndex;
+      const point = state.points[idx];
+      if (!point) return;
+      if (!Number.isFinite(Number(delta)) || Number(delta) === 0) return;
+      pushHistory();
+      point.alt = Math.max(0.0, Number(point.alt) + Number(delta || 0));
+      if (ui.alt) ui.alt.value = point.alt.toFixed(1);
+      scheduleLineRefresh();
+      refreshSelectedFields();
+      updateStatus("已调整航点 " + (idx + 1) + " 高度 " + (delta >= 0 ? "+" : "") + Number(delta).toFixed(1) + "m");
+    }
+
+    function undoChange() {
+      if (!state.undoStack.length) return;
+      const current = snapshotPoints();
+      const prev = state.undoStack.pop();
+      state.redoStack.push(current);
+      applySnapshot(prev);
+      updateHistoryButtons();
+      updateStatus("已撤销上一步修改");
+    }
+
+    function redoChange() {
+      if (!state.redoStack.length) return;
+      const current = snapshotPoints();
+      const next = state.redoStack.pop();
+      state.undoStack.push(current);
+      applySnapshot(next);
+      updateHistoryButtons();
+      updateStatus("已重做上一步修改");
+    }
+
+    function restoreCurrentPoint() {
+      const idx = state.selectedIndex;
+      const point = state.points[idx];
+      if (!point) return;
+      const originIdx = Number.isInteger(point.originIdx) ? Number(point.originIdx) : -1;
+      const origin = originIdx >= 0 && originIdx < state.original.length ? state.original[originIdx] : null;
+      if (!origin) {
+        if (state.points.length <= 2) return;
+        pushHistory();
+        state.points.splice(idx, 1);
+        const targetIdx = Math.max(0, Math.min(state.points.length - 1, idx - 1));
+        rebuildEditableLayers();
+        scheduleLineRefresh();
+        selectPoint(targetIdx, false);
+        updateStatus("已删除新增航点，回到初始航线结构");
+        return;
+      }
+      pushHistory();
+      state.points[idx] = clonePoint(origin);
+      syncMarkerPosition(idx);
+      scheduleLineRefresh();
+      refreshSelectedFields();
+      updateStatus("已还原航点 " + (idx + 1));
+    }
+
+    function restoreAllPoints() {
+      pushHistory();
+      state.points = state.original.map(function (p) {
+        return clonePoint(p);
+      });
+      rebuildEditableLayers();
+      scheduleLineRefresh();
+      refreshSelectedFields();
+      updateStatus("已还原全部航点");
+    }
+
+    function setEditMode(enabled) {
+      const next = !!enabled;
+      if (state.editEnabled === next) return;
+      state.editEnabled = next;
+      if (next) {
+        ensureMarkers();
+        if (!map.hasLayer(editLayer)) map.addLayer(editLayer);
+        if (!map.hasLayer(markerLayer)) map.addLayer(markerLayer);
+        editLine.setStyle({ weight: 5, opacity: 0.95, dashArray: null });
+        Object.keys(state.routeLayers).forEach(function (rid) {
+          const layer = state.routeLayers[rid];
+          if (!layer) return;
+          state.routeLayerWasVisible[rid] = map.hasLayer(layer);
+          if (map.hasLayer(layer)) map.removeLayer(layer);
+        });
+        if (ui.editToggle) ui.editToggle.textContent = "关闭拖拽编辑";
+        if (ui.hint) ui.hint.textContent = "拖动航点可改位置；点击蓝色航线可新增航点；支持撤销/重做。";
+        updateStatus("编辑已开启：拖动航点，或点击航线插入新航点");
+      } else {
+        if (map.hasLayer(markerLayer)) map.removeLayer(markerLayer);
+        editLine.setStyle({ weight: 4, opacity: 0.88, dashArray: "9 7" });
+        Object.keys(state.routeLayers).forEach(function (rid) {
+          const layer = state.routeLayers[rid];
+          if (!layer) return;
+          if (state.routeLayerWasVisible[rid] && !map.hasLayer(layer)) {
+            map.addLayer(layer);
+          }
+        });
+        if (ui.editToggle) ui.editToggle.textContent = "开启拖拽编辑";
+        if (ui.hint) ui.hint.textContent = "开启后可拖动编号航点，航线会实时跟随更新。";
+      }
+    }
+
+    function exportKml() {
+      const rawName = (ui.kmlName && ui.kmlName.value) || "";
+      const fileName = String(rawName || "edited_route.kml")
+        .trim()
+        .replace(/[\\\\/:*?"<>|]/g, "_")
+        .replace(/\\s+/g, "_");
+      const safeName = fileName.toLowerCase().endsWith(".kml") ? fileName : fileName + ".kml";
+      const routeName = safeName.replace(/\\.kml$/i, "");
+      const coords = state.points
+        .map(function (p) {
+          return p.lon.toFixed(6) + "," + p.lat.toFixed(6) + "," + p.alt.toFixed(2);
+        })
+        .join(" ");
+      const kml = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<kml xmlns="http://www.opengis.net/kml/2.2">',
+        "<Document>",
+        "<name>" + routeName + "</name>",
+        "<Placemark>",
+        "<name>" + routeName + "</name>",
+        "<Style><LineStyle><color>ff2a6df4</color><width>4</width></LineStyle></Style>",
+        "<LineString>",
+        "<extrude>1</extrude>",
+        "<tessellate>1</tessellate>",
+        "<altitudeMode>absolute</altitudeMode>",
+        "<coordinates>" + coords + "</coordinates>",
+        "</LineString>",
+        "</Placemark>",
+        "</Document>",
+        "</kml>",
+      ].join("");
+      const blob = new Blob([kml], { type: "application/vnd.google-earth.kml+xml;charset=utf-8" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = safeName;
+      document.body.appendChild(a);
+      a.click();
+      window.setTimeout(function () {
+        URL.revokeObjectURL(url);
+        a.remove();
+      }, 0);
+      updateStatus("已导出新KML: " + safeName);
+    }
+
+    if (ui.panelToggle) {
+      ui.panelToggle.addEventListener("click", function (event) {
+        event.preventDefault();
+        event.stopPropagation();
+        const collapsed = !panel.classList.contains("is-collapsed");
+        setPanelCollapsed(collapsed);
+      });
+    }
+    if (ui.editToggle) {
+      ui.editToggle.addEventListener("click", function () {
+        setEditMode(!state.editEnabled);
+      });
+    }
+    if (ui.prev) {
+      ui.prev.addEventListener("click", function () {
+        selectPoint(state.selectedIndex - 1, true);
+      });
+    }
+    if (ui.next) {
+      ui.next.addEventListener("click", function () {
+        selectPoint(state.selectedIndex + 1, true);
+      });
+    }
+    if (ui.index) {
+      ui.index.addEventListener("change", function () {
+        const val = Number(ui.index.value);
+        if (!Number.isFinite(val)) return;
+        selectPoint(val - 1, true);
+      });
+    }
+    if (ui.pointSelect) {
+      ui.pointSelect.addEventListener("change", function () {
+        const val = Number(ui.pointSelect.value);
+        if (!Number.isFinite(val)) return;
+        selectPoint(val, true);
+      });
+    }
+    if (ui.routeBaseSelect) {
+      ui.routeBaseSelect.addEventListener("change", function () {
+        switchRouteBase(ui.routeBaseSelect.value);
+      });
+    }
+    if (ui.advancedToggle) {
+      ui.advancedToggle.addEventListener("click", function () {
+        if (!ui.advancedWrap) return;
+        const nextCollapsed = !ui.advancedWrap.classList.contains("is-collapsed");
+        setAdvancedCollapsed(nextCollapsed);
+      });
+    }
+    if (ui.undoChange) {
+      ui.undoChange.addEventListener("click", function () {
+        undoChange();
+      });
+    }
+    if (ui.redoChange) {
+      ui.redoChange.addEventListener("click", function () {
+        redoChange();
+      });
+    }
+    if (ui.altMinus5) {
+      ui.altMinus5.addEventListener("click", function () {
+        nudgeCurrentAltitude(-5.0);
+      });
+    }
+    if (ui.altPlus5) {
+      ui.altPlus5.addEventListener("click", function () {
+        nudgeCurrentAltitude(5.0);
+      });
+    }
+    if (ui.altPlus20) {
+      ui.altPlus20.addEventListener("click", function () {
+        nudgeCurrentAltitude(20.0);
+      });
+    }
+    [ui.lon, ui.lat, ui.alt].forEach(function (input) {
+      if (!input) return;
+      input.addEventListener("change", function () {
+        applyCurrentPointFromInputs();
+      });
+      input.addEventListener("keydown", function (event) {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          applyCurrentPointFromInputs();
+        }
+      });
+    });
+    if (ui.restorePoint) {
+      ui.restorePoint.addEventListener("click", function () {
+        restoreCurrentPoint();
+      });
+    }
+    if (ui.restoreAll) {
+      ui.restoreAll.addEventListener("click", function () {
+        restoreAllPoints();
+      });
+    }
+    if (ui.locate) {
+      ui.locate.addEventListener("click", function () {
+        selectPoint(state.selectedIndex, true);
+      });
+    }
+    if (ui.saveKml) {
+      ui.saveKml.addEventListener("click", function () {
+        exportKml();
+      });
+    }
+
+    syncLine();
+    updateRouteBaseOptions();
+    rebuildEditableLayers();
+    selectPoint(0, false);
+    updateHistoryButtons();
+    setEditMode(false);
+    updateStatus("可先开启拖拽编辑，再拖动航点或点击航线插入新航点");
+    map._routeEditorReady = true;
+    triggerPanelLayout();
     return true;
   }
 
@@ -3549,7 +5500,10 @@ def _build_preview_toolbar_script_html() -> str:
       return value && value instanceof L.Map;
     });
     if (!map) return false;
-    return setupToolbar(map);
+    setupPanelLayout(map);
+    const readyEditor = setupRouteEditor(map);
+    triggerPanelLayout();
+    return !!readyEditor;
   }
 
   let attempts = 0;
@@ -3563,6 +5517,11 @@ def _build_preview_toolbar_script_html() -> str:
 })();
 </script>
 """
+    return (
+        template.replace("__ROUTE_VARIANTS_JSON__", route_variants_json)
+        .replace("__ROUTE_DEFAULT_ID_JSON__", default_variant_json)
+        .replace("__ROUTE_NAME_JSON__", route_name_json)
+    )
 
 
 def write_preview_html(
@@ -3571,19 +5530,31 @@ def write_preview_html(
     candidate_routes_wgs: List[Dict[str, Any]],
     start_wgs: Tuple[float, float],
     end_wgs: Tuple[float, float],
-    nofly_polys_xy: List[Any],
+    civil_airport_polys_xy: List[Any],
+    military_hard_nofly_polys_xy: List[Any],
+    heli_soft_nofly_polys_xy: List[Any],
     route_buffer_xy,
+    dynamic_grb_xy,
+    population_points_wgs: List[Dict[str, float]],
+    population_tiles_template: str,
+    population_tiles_min_zoom: int,
+    population_tiles_max_native_zoom: int,
+    landuse_geoms_xy: List[Any],
+    landuse_costs: List[float],
+    all_building_polys_xy: List[Any],
     high_building_polys_xy: List[Any],
     crowd_points_xy: List[Any],
     key_points_xy: List[Any],
     infra_geoms_xy: List[Any],
     high_road_lines_xy: List[Any],
     hsr_lines_xy: List[Any],
+    hv_power_lines_xy: List[Any],
     line_risk_union_xy,
-    low_risk_landuse_xy: List[Any],
     school_hard_zones_xy: List[Any],
     school_points_xy: List[Any],
-    profile_samples: List[Dict[str, float]],
+    school_point_tooltips_xy: Dict[Tuple[float, float], str],
+    crowd_point_tooltips_xy: Dict[Tuple[float, float], str],
+    key_point_tooltips_xy: Dict[Tuple[float, float], str],
     inv,
     name: str,
 ) -> None:
@@ -3634,9 +5605,68 @@ def write_preview_html(
             except Exception:
                 continue
 
+    def _point_tooltip_from_lookup(pt_xy, lookup: Dict[Tuple[float, float], str], fallback: str) -> str:
+        try:
+            key = _round_key((float(pt_xy.x), float(pt_xy.y)), snap_m=8.0)
+            if key in lookup:
+                return str(lookup[key])
+        except Exception:
+            pass
+        return fallback
+
+    def _landuse_color(cost: float) -> str:
+        c = float(cost)
+        if c <= 0.25:
+            return "#1e88e5"
+        if c <= 0.6:
+            return "#2e7d32"
+        if c <= 1.2:
+            return "#8bc34a"
+        if c <= 1.6:
+            return "#ffb300"
+        return "#e53935"
+
+    def _add_landuse_layer(
+        layer: folium.FeatureGroup,
+        geoms_xy: List[Any],
+        costs: List[float],
+    ) -> None:
+        count = min(len(geoms_xy), len(costs))
+        for i in range(count):
+            geom_xy = geoms_xy[i]
+            color = _landuse_color(costs[i])
+            try:
+                geom_wgs = transform(inv, geom_xy)
+                if geom_wgs.geom_type == "Polygon":
+                    folium.Polygon(
+                        _poly_to_latlon(geom_wgs),
+                        color=color,
+                        weight=1,
+                        fill=True,
+                        fill_opacity=0.08,
+                    ).add_to(layer)
+                elif geom_wgs.geom_type == "MultiPolygon":
+                    for p in geom_wgs.geoms:
+                        folium.Polygon(
+                            _poly_to_latlon(p),
+                            color=color,
+                            weight=1,
+                            fill=True,
+                            fill_opacity=0.08,
+                        ).add_to(layer)
+            except Exception:
+                continue
+
     center_lat = (start_wgs[1] + end_wgs[1]) / 2.0
     center_lon = (start_wgs[0] + end_wgs[0]) / 2.0
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=12, control_scale=True, tiles=None, prefer_canvas=True)
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=12,
+        control_scale=True,
+        tiles=None,
+        prefer_canvas=True,
+        max_zoom=22,
+    )
 
     folium.TileLayer(
         tiles="OpenStreetMap",
@@ -3644,6 +5674,8 @@ def write_preview_html(
         overlay=False,
         control=True,
         show=True,
+        max_native_zoom=19,
+        max_zoom=22,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",
@@ -3653,6 +5685,7 @@ def write_preview_html(
         overlay=False,
         control=True,
         show=False,
+        max_native_zoom=20,
         max_zoom=20,
     ).add_to(m)
     folium.TileLayer(
@@ -3662,7 +5695,8 @@ def write_preview_html(
         overlay=False,
         control=True,
         show=False,
-        max_zoom=20,
+        max_native_zoom=19,
+        max_zoom=22,
     ).add_to(m)
     folium.TileLayer(
         tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
@@ -3672,92 +5706,234 @@ def write_preview_html(
         control=True,
         show=False,
         opacity=0.9,
-        max_zoom=20,
+        max_native_zoom=19,
+        max_zoom=22,
     ).add_to(m)
 
-    palette = {
-        "safety_water": "#00897b",
-        "safety_default": "#1565c0",
-        "efficiency": "#ef6c00",
+    route_style = {
+        "safety_default": {
+            "line_color": "#1565c0",
+            "marker_color": "#0d47a1",
+            "layer_name": "安全优先（3D高度）",
+            "buffer_name": f"安全优先 缓冲区 {int(ROUTE_BUFFER_M)}m",
+            "buffer_color": "#1e88e5",
+            "fallback_label": "安全优先",
+        },
+        "efficiency": {
+            "line_color": "#ef6c00",
+            "marker_color": "#e65100",
+            "layer_name": "效率优先（3D高度）",
+            "buffer_name": f"效率优先 缓冲区 {int(ROUTE_BUFFER_M)}m",
+            "buffer_color": "#fb8c00",
+            "fallback_label": "效率优先",
+        },
     }
+    route_variants_for_editor: Dict[str, Dict[str, Any]] = {}
+    profile_variants_for_panel: Dict[str, Dict[str, Any]] = {}
+    default_variant_id = "safety_default"
     for cand in candidate_routes_wgs:
         cid = str(cand.get("id", "candidate"))
-        label = str(cand.get("label", cid))
-        coords = cand.get("coords") or []
-        if len(coords) < 2:
+        style = route_style.get(cid)
+        if not style:
             continue
-        color = palette.get(cid, "#455a64")
-        show_flag = bool(cand.get("show", False))
-        fg = folium.FeatureGroup(name=f"候选航线：{label}", show=show_flag)
+        alt_points = cand.get("alt_points") or []
+        points_for_editor: List[Dict[str, float]] = []
+        coords_2d: List[Tuple[float, float]] = []
+        alts: List[float] = []
+        for pt in alt_points:
+            try:
+                lon = float(pt[0])
+                lat = float(pt[1])
+                alt = float(pt[2])
+            except Exception:
+                continue
+            points_for_editor.append({"lon": lon, "lat": lat, "alt": alt})
+            coords_2d.append((lat, lon))
+            alts.append(alt)
+        if len(points_for_editor) < 2:
+            coords = cand.get("coords") or []
+            for lat, lon in coords:
+                try:
+                    points_for_editor.append({"lon": float(lon), "lat": float(lat), "alt": 60.0})
+                except Exception:
+                    continue
+            coords_2d = [(float(p["lat"]), float(p["lon"])) for p in points_for_editor]
+            alts = [float(p["alt"]) for p in points_for_editor]
+        if len(points_for_editor) < 2:
+            continue
+        if bool(cand.get("show", False)):
+            default_variant_id = cid
+        label = str(cand.get("label", style["fallback_label"]))
+        route_variants_for_editor[cid] = {"label": label, "points": points_for_editor}
+        profile_samples_variant = cand.get("profile_samples") or []
+        if isinstance(profile_samples_variant, list) and len(profile_samples_variant) >= 2:
+            profile_variants_for_panel[cid] = {"label": label, "samples": profile_samples_variant}
+
+        route_layer = folium.FeatureGroup(name=style["layer_name"], show=True)
+        distance_km = _safe_float(cand.get("distance_km", 0.0), 0.0)
+        tip = f"{label} | {distance_km:.2f} km | 高度最小/最大 {min(alts):.1f}/{max(alts):.1f} m"
+        folium.PolyLine(coords_2d, color=style["line_color"], weight=4, opacity=0.92, tooltip=tip).add_to(route_layer)
+        step = max(1, len(points_for_editor) // 120)
+        for i in range(0, len(points_for_editor), step):
+            p = points_for_editor[i]
+            folium.CircleMarker(
+                [p["lat"], p["lon"]],
+                radius=2,
+                color=style["marker_color"],
+                fill=True,
+                fill_opacity=0.8,
+                tooltip=f"高度 {p['alt']:.1f} m",
+            ).add_to(route_layer)
+        route_layer.add_to(m)
+
+        buf_layer = folium.FeatureGroup(name=style["buffer_name"], show=True)
+        route_buffer_variant = cand.get("route_buffer_xy")
+        if route_buffer_variant is not None and (not route_buffer_variant.is_empty):
+            _add_polygon_layer(
+                buf_layer,
+                [route_buffer_variant],
+                color=style["buffer_color"],
+                fill_opacity=0.08,
+                max_items=1,
+            )
+        buf_layer.add_to(m)
+
+    if not route_variants_for_editor and len(route_points) >= 2:
+        fallback_points = [
+            {"lon": float(lon), "lat": float(lat), "alt": float(alt)}
+            for lon, lat, alt in route_points
+        ]
+        route_variants_for_editor["safety_default"] = {"label": "安全优先", "points": fallback_points}
+        fallback_route = folium.FeatureGroup(name="安全优先（3D高度）", show=True)
         folium.PolyLine(
-            coords,
-            color=color,
-            weight=4 if show_flag else 3,
-            opacity=0.92 if show_flag else 0.78,
-            tooltip=f"{label} | {cand.get('distance_km', 0.0):.2f} km",
-        ).add_to(fg)
-        fg.add_to(m)
+            [(float(lat), float(lon)) for lon, lat, _ in route_points],
+            color="#1565c0",
+            weight=4,
+            opacity=0.92,
+            tooltip=f"安全优先 | 高度最小/最大 {min(alt for _, _, alt in route_points):.1f}/{max(alt for _, _, alt in route_points):.1f} m",
+        ).add_to(fallback_route)
+        fallback_route.add_to(m)
+        fallback_buf = folium.FeatureGroup(name=f"安全优先 缓冲区 {int(ROUTE_BUFFER_M)}m", show=True)
+        if route_buffer_xy is not None and (not route_buffer_xy.is_empty):
+            _add_polygon_layer(fallback_buf, [route_buffer_xy], color="#1e88e5", fill_opacity=0.08, max_items=1)
+        fallback_buf.add_to(m)
+    dyn_grb_layer = folium.FeatureGroup(name="动态 GRB（AGL 1:1）", show=False)
+    if dynamic_grb_xy is not None and (not dynamic_grb_xy.is_empty):
+        _add_polygon_layer(dyn_grb_layer, [dynamic_grb_xy], color="#26a69a", fill_opacity=0.1, max_items=1)
+    dyn_grb_layer.add_to(m)
 
-    route_layer = folium.FeatureGroup(name="主航线（3D高度）", show=True)
-    route_coords = [(lat, lon) for lon, lat, _ in route_points]
-    alts = [alt for _, _, alt in route_points]
-    tip = f"{name} | 高度最小/最大 {min(alts):.1f}/{max(alts):.1f} m"
-    folium.PolyLine(route_coords, color="#1565c0", weight=4, tooltip=tip).add_to(route_layer)
-    step = max(1, len(route_points) // 120)
-    for i in range(0, len(route_points), step):
-        lon, lat, alt = route_points[i]
-        c = "#0d47a1" if alt <= 90 else ("#f57f17" if alt <= 120 else "#c62828")
-        folium.CircleMarker(
-            [lat, lon],
-            radius=2,
-            color=c,
-            fill=True,
-            fill_opacity=0.8,
-            tooltip=f"高度 {alt:.1f} m",
-        ).add_to(route_layer)
-    route_layer.add_to(m)
+    if population_tiles_template:
+        folium.TileLayer(
+            tiles=population_tiles_template,
+            name="人口密度",
+            attr="Population Density Heatmap",
+            overlay=True,
+            control=True,
+            show=False,
+            opacity=0.7,
+            min_zoom=max(0, int(population_tiles_min_zoom)),
+            max_native_zoom=max(0, int(population_tiles_max_native_zoom)),
+            max_zoom=22,
+            tms=True,
+        ).add_to(m)
+    else:
+        pop_layer = folium.FeatureGroup(name="人口密度", show=False)
+        pop_vals = [float(p.get("value", 0.0)) for p in population_points_wgs if _safe_float(p.get("value", 0.0), 0.0) > 0.0]
+        norm_base = _percentile(pop_vals, 0.95) if pop_vals else 0.0
+        if norm_base <= 0.0 and pop_vals:
+            norm_base = max(pop_vals)
+        heat_points: List[List[float]] = []
+        for p in population_points_wgs:
+            lat = _safe_float(p.get("lat", 0.0), 0.0)
+            lon = _safe_float(p.get("lon", 0.0), 0.0)
+            val = _safe_float(p.get("value", 0.0), 0.0)
+            if val <= 0.0:
+                continue
+            weight = min(1.0, val / max(1.0, norm_base))
+            heat_points.append([lat, lon, max(0.05, weight)])
+        if heat_points:
+            HeatMap(
+                heat_points,
+                min_opacity=0.28,
+                radius=16,
+                blur=14,
+                max_zoom=18,
+                gradient={0.2: "#64b5f6", 0.4: "#4fc3f7", 0.6: "#ffeb3b", 0.8: "#ff9800", 1.0: "#d32f2f"},
+            ).add_to(pop_layer)
+        pop_layer.add_to(m)
 
-    buf_layer = folium.FeatureGroup(name=f"航线缓冲区 {int(ROUTE_BUFFER_M)}m", show=True)
-    if route_buffer_xy is not None and (not route_buffer_xy.is_empty):
-        _add_polygon_layer(buf_layer, [route_buffer_xy], color="#1e88e5", fill_opacity=0.08, max_items=1)
-    buf_layer.add_to(m)
+    civil_airport_layer = folium.FeatureGroup(name="民航机场禁飞区（CAAC）", show=True)
+    _add_polygon_layer(civil_airport_layer, civil_airport_polys_xy, color="#7b1fa2", fill_opacity=0.2, max_items=260)
+    civil_airport_layer.add_to(m)
 
-    nofly_layer = folium.FeatureGroup(name="禁飞区（民航/军用机场）", show=True)
-    _add_polygon_layer(nofly_layer, nofly_polys_xy, color="#d32f2f", fill_opacity=0.2, max_items=200)
-    nofly_layer.add_to(m)
+    military_nofly_layer = folium.FeatureGroup(name="军用机场禁飞区（硬约束）", show=True)
+    _add_polygon_layer(military_nofly_layer, military_hard_nofly_polys_xy, color="#d32f2f", fill_opacity=0.22, max_items=220)
+    military_nofly_layer.add_to(m)
+
+    heli_soft_layer = folium.FeatureGroup(name="直升机场避让区（软约束）", show=True)
+    _add_polygon_layer(heli_soft_layer, heli_soft_nofly_polys_xy, color="#ef6c00", fill_opacity=0.16, max_items=260)
+    heli_soft_layer.add_to(m)
+
+    landuse_layer = folium.FeatureGroup(name="土地利用", show=False)
+    _add_landuse_layer(landuse_layer, landuse_geoms_xy, landuse_costs)
+    landuse_layer.add_to(m)
+
+    all_build_layer = folium.FeatureGroup(name="全部建筑物", show=False)
+    _add_polygon_layer(all_build_layer, all_building_polys_xy, color="#8d6e63", fill_opacity=0.08, max_items=1200)
+    all_build_layer.add_to(m)
 
     high_build_layer = folium.FeatureGroup(name=f"高层建筑（>={int(HIGH_BUILDING_THRESHOLD_M)}m）", show=False)
     _add_polygon_layer(high_build_layer, high_building_polys_xy, color="#ef6c00", fill_opacity=0.22, max_items=700)
     high_build_layer.add_to(m)
-
-    low_risk_layer = folium.FeatureGroup(name="低风险地表（水域/林地/绿地）", show=False)
-    _add_polygon_layer(low_risk_layer, low_risk_landuse_xy, color="#2e7d32", fill_opacity=0.08, max_items=800)
-    low_risk_layer.add_to(m)
 
     school_layer = folium.FeatureGroup(name="学校/幼儿园避让区", show=False)
     _add_polygon_layer(school_layer, school_hard_zones_xy, color="#c62828", fill_opacity=0.16, max_items=600)
     for pxy in school_points_xy[:800]:
         try:
             pwgs = transform(inv, pxy)
-            folium.CircleMarker([pwgs.y, pwgs.x], radius=2, color="#b71c1c", fill=True, fill_opacity=0.85).add_to(school_layer)
+            tip = _point_tooltip_from_lookup(pxy, school_point_tooltips_xy, "名称: 未命名POI | 类型: 学校/幼儿园")
+            folium.CircleMarker(
+                [pwgs.y, pwgs.x],
+                radius=2,
+                color="#b71c1c",
+                fill=True,
+                fill_opacity=0.85,
+                tooltip=tip,
+            ).add_to(school_layer)
         except Exception:
             continue
     school_layer.add_to(m)
 
-    crowd_layer = folium.FeatureGroup(name="人群敏感 POI", show=False)
+    crowd_layer = folium.FeatureGroup(name="人群聚集 POI", show=False)
     for pxy in crowd_points_xy[:1200]:
         try:
             pwgs = transform(inv, pxy)
-            folium.CircleMarker([pwgs.y, pwgs.x], radius=2, color="#ad1457", fill=True, fill_opacity=0.7).add_to(crowd_layer)
+            tip = _point_tooltip_from_lookup(pxy, crowd_point_tooltips_xy, "名称: 未命名POI | 类型: 人群聚集点")
+            folium.CircleMarker(
+                [pwgs.y, pwgs.x],
+                radius=2,
+                color="#ad1457",
+                fill=True,
+                fill_opacity=0.7,
+                tooltip=tip,
+            ).add_to(crowd_layer)
         except Exception:
             continue
     crowd_layer.add_to(m)
 
-    key_layer = folium.FeatureGroup(name="关键设施 POI", show=False)
+    key_layer = folium.FeatureGroup(name="敏感设施 POI", show=False)
     for pxy in key_points_xy[:800]:
         try:
             pwgs = transform(inv, pxy)
-            folium.CircleMarker([pwgs.y, pwgs.x], radius=3, color="#6a1b9a", fill=True, fill_opacity=0.85).add_to(key_layer)
+            tip = _point_tooltip_from_lookup(pxy, key_point_tooltips_xy, "名称: 未命名POI | 类型: 敏感设施")
+            folium.CircleMarker(
+                [pwgs.y, pwgs.x],
+                radius=3,
+                color="#6a1b9a",
+                fill=True,
+                fill_opacity=0.85,
+                tooltip=tip,
+            ).add_to(key_layer)
         except Exception:
             continue
     key_layer.add_to(m)
@@ -3766,9 +5942,10 @@ def write_preview_html(
     _add_polygon_layer(infra_layer, infra_geoms_xy, color="#455a64", fill_opacity=0.14, max_items=500)
     infra_layer.add_to(m)
 
-    line_layer = folium.FeatureGroup(name="线性风险（高速/高铁）", show=False)
+    line_layer = folium.FeatureGroup(name="线性风险（高速/高铁/高压电力线）", show=False)
     _add_line_layer(line_layer, high_road_lines_xy, color="#b71c1c", max_items=800)
     _add_line_layer(line_layer, hsr_lines_xy, color="#1b5e20", max_items=500)
+    _add_line_layer(line_layer, hv_power_lines_xy, color="#ff8f00", max_items=600)
     if line_risk_union_xy is not None and (not line_risk_union_xy.is_empty):
         _add_polygon_layer(line_layer, [line_risk_union_xy], color="#8d6e63", fill_opacity=0.1, max_items=1)
     line_layer.add_to(m)
@@ -3778,15 +5955,27 @@ def write_preview_html(
     folium.Marker([end_wgs[1], end_wgs[0]], tooltip="终点", icon=folium.Icon(color="red")).add_to(start_end_layer)
     start_end_layer.add_to(m)
 
-    folium.LayerControl(collapsed=True).add_to(m)
+    folium.LayerControl(collapsed=False).add_to(m)
     html_text = m.get_root().render()
     if "</head>" in html_text:
         html_text = html_text.replace("</head>", _build_preview_theme_head_html() + "\n</head>")
-    panel_html = _build_profile_panel_html(name=name, profile_samples=profile_samples)
+    panel_html = _build_profile_panel_html(
+        name=name,
+        profile_variants=profile_variants_for_panel,
+        default_profile_variant_id=default_variant_id,
+    )
     if panel_html and "</body>" in html_text:
         html_text = html_text.replace("</body>", panel_html + "\n</body>")
     if "</html>" in html_text:
-        html_text = html_text.replace("</html>", _build_preview_toolbar_script_html() + "\n</html>")
+        html_text = html_text.replace(
+            "</html>",
+            _build_preview_toolbar_script_html(
+                name=name,
+                route_variants=route_variants_for_editor,
+                default_route_variant_id=default_variant_id,
+            )
+            + "\n</html>",
+        )
     path.write_text(html_text, encoding="utf-8")
 
 
@@ -3803,7 +5992,7 @@ def main() -> None:
     parser.add_argument("--profile", choices=["fastest", "balanced", "safest"], default="balanced")
     parser.add_argument(
         "--select-candidate",
-        choices=["safety_water", "safety_default", "efficiency"],
+        choices=["safety_default", "efficiency"],
         default="safety_default",
         help="Select which internal candidate to export as main route output.",
     )
@@ -3811,7 +6000,7 @@ def main() -> None:
         "--weight-sweep-levels",
         type=int,
         default=0,
-        help="Extra sweep candidate count between safety_default and efficiency (0 disables sweep).",
+        help="Deprecated in 2-candidate mode; accepted for compatibility but ignored.",
     )
     parser.add_argument(
         "--pareto-select",
@@ -3871,7 +6060,7 @@ def main() -> None:
         dest="open_data_no_fly",
         action="store_true",
         default=True,
-        help="Enable airport/military-airfield no-fly from OSM.",
+        help="Enable open-data no-fly: civil airports from CAAC dataset + military/heli tags from OSM.",
     )
     parser.add_argument(
         "--no-open-data-no-fly",
@@ -3879,8 +6068,30 @@ def main() -> None:
         action="store_false",
         help="Disable open-data no-fly filtering.",
     )
+    parser.add_argument(
+        "--civil-airport-no-fly-geojson",
+        default=str(DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON),
+        help="Civil airport no-fly dataset (GeoJSON converted from CAAC XLS).",
+    )
     parser.add_argument("--soft-no-fly-scale", type=float, default=1.0, help="Scale factor for soft no-fly penalty.")
-    parser.add_argument("--infra-hard-buffer-m", type=float, default=0.0, help="Hard exclusion around key infrastructure.")
+    parser.add_argument(
+        "--infra-hard-buffer-m",
+        type=float,
+        default=0.0,
+        help="Legacy global hard exclusion around key infrastructure (kept for compatibility).",
+    )
+    parser.add_argument(
+        "--safety-sensitive-hard-buffer-m",
+        type=float,
+        default=SAFETY_SENSITIVE_HARD_BUFFER_M,
+        help="Hard exclusion buffer around sensitive facilities for safety route.",
+    )
+    parser.add_argument(
+        "--safety-infra-hard-buffer-m",
+        type=float,
+        default=SAFETY_INFRA_HARD_BUFFER_M,
+        help="Hard exclusion buffer around critical infrastructure for safety route.",
+    )
     parser.add_argument("--clearance-m", type=float, default=DEFAULT_AIRFRAME["clearance_m"])
     parser.add_argument(
         "--endpoint-true-height-m",
@@ -3999,6 +6210,7 @@ def main() -> None:
         help="Optional snapshot output dir; default is <out-dir>/snapshots.",
     )
     args = parser.parse_args()
+    effective_clearance_m = max(30.0, float(args.clearance_m))
 
     root = Path(__file__).resolve().parents[3]
     if args.od_kml:
@@ -4033,17 +6245,26 @@ def main() -> None:
     landuse_id_map = _build_geom_id_map(landuse_geoms)
     infra_geoms, infra_severities, infra_tree = build_infrastructure_index(summary, route_bbox, fwd)
     infra_id_map = _build_geom_id_map(infra_geoms)
-    crowd_points_xy, crowd_tree, crowd_id_map, key_points_xy, key_tree, key_id_map, poi_risk_counter = build_poi_risk_indices(
-        summary,
-        fwd,
+    (
+        crowd_points_xy,
+        crowd_tree,
+        crowd_id_map,
+        key_points_xy,
+        key_tree,
+        key_id_map,
+        poi_risk_counter,
+        crowd_poi_items,
+        key_poi_items,
+    ) = build_poi_risk_indices(summary, fwd)
+    high_road_lines_xy, line_risk_union_xy, hsr_lines_xy, hv_power_lines_xy, line_risk_counter = build_line_risk_geometries(
+        summary, route_bbox, fwd
     )
-    high_road_lines_xy, line_risk_union_xy, hsr_lines_xy, line_risk_counter = build_line_risk_geometries(summary, route_bbox, fwd)
-    school_hard_zones_xy, school_points_xy, school_counter = fetch_school_kindergarten_zones(route_bbox, fwd)
+    school_hard_zones_xy, school_points_xy, school_counter, school_poi_items = fetch_school_kindergarten_zones(route_bbox, fwd)
+    crowd_display_items: List[Dict[str, Any]] = list(crowd_poi_items)
     if school_points_xy:
         crowd_points_xy.extend(school_points_xy)
+        crowd_display_items.extend(school_poi_items)
         poi_risk_counter["crowd"] = int(poi_risk_counter.get("crowd", 0) + len(school_points_xy))
-        crowd_tree = STRtree(crowd_points_xy) if crowd_points_xy else None
-        crowd_id_map = _build_geom_id_map(crowd_points_xy)
     school_hard_union_xy = unary_union(school_hard_zones_xy) if school_hard_zones_xy else None
     if school_hard_union_xy is not None and (not school_hard_union_xy.is_empty):
         relief = Point(start_xy).buffer(SCHOOL_ENDPOINT_RELIEF_M).union(Point(end_xy).buffer(SCHOOL_ENDPOINT_RELIEF_M))
@@ -4056,9 +6277,32 @@ def main() -> None:
 
     nofly_hard_polys_xy: List[Any] = []
     nofly_soft_polys_xy: List[Any] = []
-    nofly_counter = {"civil_airport": 0, "military_airport": 0, "hard": 0, "soft": 0}
+    nofly_military_hard_polys_xy: List[Any] = []
+    nofly_heli_soft_polys_xy: List[Any] = []
+    civil_airport_route_scope_polys_xy: List[Any] = []
+    civil_airport_display_polys_xy: List[Any] = []
+    nofly_counter: Dict[str, Any] = {"civil_airport": 0, "military_airport": 0, "hard": 0, "soft": 0}
+    city_bbox_info = summary.get("bbox", {}) if isinstance(summary.get("bbox", {}), dict) else {}
+    city_bbox = (
+        _safe_float(city_bbox_info.get("south", route_bbox[0])),
+        _safe_float(city_bbox_info.get("north", route_bbox[1])),
+        _safe_float(city_bbox_info.get("west", route_bbox[2])),
+        _safe_float(city_bbox_info.get("east", route_bbox[3])),
+    )
     if args.open_data_no_fly:
-        nofly_hard_polys_xy, nofly_soft_polys_xy, nofly_counter = fetch_open_data_no_fly_zones(route_bbox, fwd)
+        nofly_hard_polys_xy, nofly_soft_polys_xy, nofly_counter, civil_airport_route_scope_polys_xy, nofly_military_hard_polys_xy, nofly_heli_soft_polys_xy = fetch_open_data_no_fly_zones(
+            route_bbox,
+            fwd,
+            civil_airport_geojson=args.civil_airport_no_fly_geojson,
+        )
+        civil_airport_display_polys_xy, civil_city_stats = load_civil_airport_no_fly_zones(
+            city_bbox,
+            fwd,
+            dataset_geojson_path=args.civil_airport_no_fly_geojson,
+        )
+        if not civil_airport_display_polys_xy:
+            civil_airport_display_polys_xy = list(civil_airport_route_scope_polys_xy)
+        nofly_counter["civil_dataset_city_scope"] = civil_city_stats
     nofly_hard_union_xy = unary_union(nofly_hard_polys_xy) if nofly_hard_polys_xy else None
     nofly_soft_union_xy = unary_union(nofly_soft_polys_xy) if nofly_soft_polys_xy else None
     if nofly_hard_union_xy is not None and (not nofly_hard_union_xy.is_empty):
@@ -4072,14 +6316,59 @@ def main() -> None:
     o_tree = STRtree(o_geoms) if o_geoms else None
     b_id_map = _build_geom_id_map(b_geoms)
     o_id_map = _build_geom_id_map(o_geoms)
+    high_rise_points_xy: List[Any] = []
     high_building_polys_xy = [g.buffer(HIGH_BUILDING_AVOID_BUFFER_M) for g, h in zip(b_geoms, b_heights) if h >= HIGH_BUILDING_THRESHOLD_M]
+    for g, h in zip(b_geoms, b_heights):
+        if h < HIGH_BUILDING_THRESHOLD_M:
+            continue
+        try:
+            high_rise_points_xy.append(g.representative_point())
+        except Exception:
+            continue
     high_building_union_xy = unary_union(high_building_polys_xy) if high_building_polys_xy else None
+    if high_rise_points_xy:
+        crowd_points_xy.extend(high_rise_points_xy)
+        for pt in high_rise_points_xy:
+            crowd_display_items.append(
+                {
+                    "point_xy": pt,
+                    "name": "高层建筑",
+                    "type": "高层建筑",
+                    "source": "建筑物",
+                }
+            )
+        poi_risk_counter["crowd"] = int(poi_risk_counter.get("crowd", 0) + len(high_rise_points_xy))
+        poi_risk_counter["crowd_from_high_rise"] = int(len(high_rise_points_xy))
 
-    infra_hard_union_xy = None
+    crowd_points_xy = _dedupe_point_geometries(crowd_points_xy, snap_m=8.0)
+    key_points_xy = _dedupe_point_geometries(key_points_xy, snap_m=8.0)
+    school_point_tooltips_xy = _build_poi_tooltip_lookup(school_poi_items, snap_m=8.0)
+    crowd_point_tooltips_xy = _build_poi_tooltip_lookup(crowd_display_items, snap_m=8.0)
+    key_point_tooltips_xy = _build_poi_tooltip_lookup(key_poi_items, snap_m=8.0)
+    crowd_tree = STRtree(crowd_points_xy) if crowd_points_xy else None
+    crowd_id_map = _build_geom_id_map(crowd_points_xy)
+    key_tree = STRtree(key_points_xy) if key_points_xy else None
+    key_id_map = _build_geom_id_map(key_points_xy)
+
+    legacy_infra_hard_union_xy = None
     if args.infra_hard_buffer_m > 0 and infra_geoms:
-        hard_geoms = [g.buffer(args.infra_hard_buffer_m) for g, sev in zip(infra_geoms, infra_severities) if sev >= 2.0]
+        hard_geoms = [
+            g.buffer(float(args.infra_hard_buffer_m))
+            for g, sev in zip(infra_geoms, infra_severities)
+            if sev >= CRITICAL_INFRA_MIN_SEVERITY
+        ]
         if hard_geoms:
-            infra_hard_union_xy = unary_union(hard_geoms)
+            legacy_infra_hard_union_xy = unary_union(hard_geoms)
+    safety_infra_hard_union_xy = None
+    if args.safety_infra_hard_buffer_m > 0 and infra_geoms:
+        hard_geoms = [
+            g.buffer(float(args.safety_infra_hard_buffer_m))
+            for g, sev in zip(infra_geoms, infra_severities)
+            if sev >= CRITICAL_INFRA_MIN_SEVERITY
+        ]
+        if hard_geoms:
+            safety_infra_hard_union_xy = unary_union(hard_geoms)
+    sensitive_hard_union_xy = _buffer_union_from_points(key_points_xy, float(args.safety_sensitive_hard_buffer_m))
 
     networks_wgs = load_city_networks(summary, route_bbox)
     networks_xy = project_lines(networks_wgs, fwd)
@@ -4138,10 +6427,25 @@ def main() -> None:
         weight_scale: Dict[str, float],
         school_penalty_air: float,
         school_penalty_ground: float,
+        enable_sensitive_hard_constraint: bool,
+        enable_infra_hard_constraint: bool,
     ) -> Optional[Dict[str, Any]]:
         local_weights = WEIGHT_PROFILES[profile_key].copy()
         min_turn_angle_deg = max(60.0, min(179.0, float(args.min_turn_angle_deg)))
         max_turn_deflection_deg = max(1.0, 180.0 - min_turn_angle_deg)
+        local_sensitive_hard_union_xy = sensitive_hard_union_xy if enable_sensitive_hard_constraint else None
+        local_infra_hard_union_xy = legacy_infra_hard_union_xy
+        if enable_infra_hard_constraint and safety_infra_hard_union_xy is not None:
+            if local_infra_hard_union_xy is None:
+                local_infra_hard_union_xy = safety_infra_hard_union_xy
+            else:
+                local_infra_hard_union_xy = unary_union([local_infra_hard_union_xy, safety_infra_hard_union_xy])
+        local_crowd_hard_union_xy = school_hard_union_xy
+        if local_sensitive_hard_union_xy is not None:
+            if local_crowd_hard_union_xy is None:
+                local_crowd_hard_union_xy = local_sensitive_hard_union_xy
+            else:
+                local_crowd_hard_union_xy = unary_union([local_crowd_hard_union_xy, local_sensitive_hard_union_xy])
 
         def _turn_angle_ok(poly: List[Tuple[float, float]]) -> bool:
             return polyline_min_interior_angle(poly) >= (min_turn_angle_deg - 1e-6)
@@ -4157,7 +6461,7 @@ def main() -> None:
             weights=local_weights,
             no_fly_hard_union_xy=nofly_hard_union_xy,
             no_fly_soft_union_xy=nofly_soft_union_xy,
-            infra_hard_union_xy=infra_hard_union_xy,
+            infra_hard_union_xy=local_infra_hard_union_xy,
             landuse_geoms=landuse_geoms,
             landuse_costs=landuse_costs,
             landuse_tree=landuse_tree,
@@ -4179,7 +6483,8 @@ def main() -> None:
             crowd_points_xy=crowd_points_xy,
             crowd_tree=crowd_tree,
             crowd_id_map=crowd_id_map,
-            crowd_hard_union_xy=school_hard_union_xy,
+            school_hard_union_xy=school_hard_union_xy,
+            sensitive_hard_union_xy=local_sensitive_hard_union_xy,
             school_penalty_air=float(school_penalty_air),
             school_penalty_ground=float(school_penalty_ground),
             key_points_xy=key_points_xy,
@@ -4247,8 +6552,8 @@ def main() -> None:
             pop_sampler=pop_sampler,
             inv=inv,
             no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=infra_hard_union_xy,
-            crowd_hard_union_xy=school_hard_union_xy,
+            infra_hard_union_xy=local_infra_hard_union_xy,
+            crowd_hard_union_xy=local_crowd_hard_union_xy,
             passes=3,
             max_hop=20,
             max_jump_m=2000.0,
@@ -4259,8 +6564,8 @@ def main() -> None:
             pop_sampler=pop_sampler,
             inv=inv,
             no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=infra_hard_union_xy,
-            crowd_hard_union_xy=school_hard_union_xy,
+            infra_hard_union_xy=local_infra_hard_union_xy,
+            crowd_hard_union_xy=local_crowd_hard_union_xy,
             passes=4,
         )
         if _turn_angle_ok(cand):
@@ -4270,8 +6575,8 @@ def main() -> None:
             pop_sampler=pop_sampler,
             inv=inv,
             no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=infra_hard_union_xy,
-            crowd_hard_union_xy=school_hard_union_xy,
+            infra_hard_union_xy=local_infra_hard_union_xy,
+            crowd_hard_union_xy=local_crowd_hard_union_xy,
             min_turn_keep_deg=float(args.min_turn_keep_deg),
             passes=max(1, int(args.turn_prune_passes)),
         )
@@ -4281,8 +6586,8 @@ def main() -> None:
             pop_sampler=pop_sampler,
             inv=inv,
             no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=infra_hard_union_xy,
-            crowd_hard_union_xy=school_hard_union_xy,
+            infra_hard_union_xy=local_infra_hard_union_xy,
+            crowd_hard_union_xy=local_crowd_hard_union_xy,
             passes=3,
         )
         if _turn_angle_ok(cand):
@@ -4297,8 +6602,8 @@ def main() -> None:
                 pop_sampler=pop_sampler,
                 inv=inv,
                 no_fly_hard_union_xy=nofly_hard_union_xy,
-                infra_hard_union_xy=infra_hard_union_xy,
-                crowd_hard_union_xy=school_hard_union_xy,
+                infra_hard_union_xy=local_infra_hard_union_xy,
+                crowd_hard_union_xy=local_crowd_hard_union_xy,
             )
             cand = enforce_min_turn_angle(
                 cand,
@@ -4306,8 +6611,8 @@ def main() -> None:
                 pop_sampler=pop_sampler,
                 inv=inv,
                 no_fly_hard_union_xy=nofly_hard_union_xy,
-                infra_hard_union_xy=infra_hard_union_xy,
-                crowd_hard_union_xy=school_hard_union_xy,
+                infra_hard_union_xy=local_infra_hard_union_xy,
+                crowd_hard_union_xy=local_crowd_hard_union_xy,
                 passes=3,
             )
             if _turn_angle_ok(cand):
@@ -4357,6 +6662,7 @@ def main() -> None:
             "min_turn_angle_deg": round(float(min_turn_angle_local), 2),
             "buffer_metrics": {
                 "crowd_points_in_buffer": int(crowd_in_buf_local),
+                "sensitive_facility_points_in_buffer": int(key_in_buf_local),
                 "key_facility_points_in_buffer": int(key_in_buf_local),
                 "critical_infra_geoms_in_buffer": int(infra_in_buf_local),
                 "line_risk_overlap_m": round(line_overlap_local, 2),
@@ -4367,32 +6673,8 @@ def main() -> None:
 
     core_candidate_specs = [
         CandidateSpec(
-            id="safety_water",
-            label="1) 安全优先 + 水路偏好",
-            profile_key="safest",
-            enable_water_connectors=bool(long_water_available),
-            water_pref_factor=0.5,
-            allow_water_choice=True,
-            water_detour_limit=2.0 if long_water_available else 1.18,
-            min_water_share=0.2,
-            weight_scale={
-                "length": 0.86,
-                "population": 1.45,
-                "landuse": 1.38,
-                "infrastructure": 1.42,
-                "altitude": 1.25,
-                "turn": 1.2,
-                "crowd": 1.5,
-                "key_facility": 1.45,
-                "line_cross": 1.4,
-                "high_building": 1.35,
-            },
-            school_penalty_air=14.0,
-            school_penalty_ground=10.5,
-        ),
-        CandidateSpec(
             id="safety_default",
-            label="2) 安全优先（默认）",
+            label="安全优先",
             profile_key="safest",
             enable_water_connectors=False,
             water_pref_factor=0.72,
@@ -4409,14 +6691,15 @@ def main() -> None:
                 "crowd": 1.28,
                 "key_facility": 1.2,
                 "line_cross": 1.18,
-                "high_building": 1.15,
             },
             school_penalty_air=11.0,
             school_penalty_ground=8.0,
+            enable_sensitive_hard_constraint=True,
+            enable_infra_hard_constraint=True,
         ),
         CandidateSpec(
             id="efficiency",
-            label="3) 效率优先",
+            label="效率优先",
             profile_key="fastest",
             enable_water_connectors=False,
             water_pref_factor=1.0,
@@ -4434,25 +6717,15 @@ def main() -> None:
                 "crowd": 0.24,
                 "key_facility": 0.28,
                 "line_cross": 0.3,
-                "high_building": 0.38,
             },
             school_penalty_air=5.0,
             school_penalty_ground=3.8,
         ),
     ]
-    sweep_candidate_specs = build_sweep_candidate_specs(
-        int(args.weight_sweep_levels),
-        profile_key=str(args.profile),
-        long_water_available=bool(long_water_available),
-        safety_scale=core_candidate_specs[1].weight_scale,
-        efficiency_scale=core_candidate_specs[2].weight_scale,
-        safety_school_air=float(core_candidate_specs[1].school_penalty_air),
-        safety_school_ground=float(core_candidate_specs[1].school_penalty_ground),
-        efficiency_school_air=float(core_candidate_specs[2].school_penalty_air),
-        efficiency_school_ground=float(core_candidate_specs[2].school_penalty_ground),
-    )
-    candidate_specs = core_candidate_specs + sweep_candidate_specs
-    core_candidate_ids = {spec.id for spec in core_candidate_specs}
+    sweep_candidate_specs: List[CandidateSpec] = []
+    if int(args.weight_sweep_levels) > 0:
+        print("[WARN] weight sweep is disabled in 2-candidate mode; ignoring --weight-sweep-levels.", flush=True)
+    candidate_specs = list(core_candidate_specs)
 
     candidate_results: List[Dict[str, Any]] = []
     candidate_failures: List[Dict[str, Any]] = []
@@ -4471,6 +6744,8 @@ def main() -> None:
                 weight_scale=spec.weight_scale,
                 school_penalty_air=spec.school_penalty_air,
                 school_penalty_ground=spec.school_penalty_ground,
+                enable_sensitive_hard_constraint=bool(spec.enable_sensitive_hard_constraint),
+                enable_infra_hard_constraint=bool(spec.enable_infra_hard_constraint),
             )
         except Exception as exc:
             solved = None
@@ -4513,7 +6788,7 @@ def main() -> None:
                 speed_ms=float(args.speed_ms),
                 climb_ms=float(args.climb_ms),
                 descend_ms=float(args.descend_ms),
-                clearance_m=float(args.clearance_m),
+                clearance_m=float(effective_clearance_m),
                 preferred_cruise_max_m=float(args.preferred_cruise_max_m),
                 hard_ceiling_m=float(args.hard_ceiling_m),
                 min_true_height_m=float(args.min_true_height_m),
@@ -4630,7 +6905,12 @@ def main() -> None:
     turns_before = int(selected_candidate["turns_before"])
     turns_after = int(selected_candidate["turns_after"])
     crowd_in_buffer = int(selected_candidate["buffer_metrics"]["crowd_points_in_buffer"])
-    key_in_buffer = int(selected_candidate["buffer_metrics"]["key_facility_points_in_buffer"])
+    sensitive_in_buffer = int(
+        selected_candidate["buffer_metrics"].get(
+            "sensitive_facility_points_in_buffer",
+            selected_candidate["buffer_metrics"].get("key_facility_points_in_buffer", 0),
+        )
+    )
     infra_in_buffer = int(selected_candidate["buffer_metrics"]["critical_infra_geoms_in_buffer"])
     line_overlap_m = float(selected_candidate["buffer_metrics"]["line_risk_overlap_m"])
     high_build_overlap_m = float(selected_candidate["buffer_metrics"]["high_building_overlap_m"])
@@ -4649,7 +6929,34 @@ def main() -> None:
     evidence_out = out_dir / f"{base_name}_evidence.json"
     snapshot_root = Path(args.snapshot_dir).resolve() if args.snapshot_dir else (out_dir / "snapshots").resolve()
     snapshot_out = snapshot_root / f"{base_name}_snapshot.json"
-    low_risk_landuse_xy, low_risk_counter = load_low_risk_landuse_polygons(summary, fwd)
+    landuse_display_counter = {
+        "total": int(len(landuse_geoms)),
+        "low_cost": int(sum(1 for c in landuse_costs if c <= 0.6)),
+        "medium_cost": int(sum(1 for c in landuse_costs if 0.6 < c <= 1.2)),
+        "high_cost": int(sum(1 for c in landuse_costs if c > 1.2)),
+    }
+    population_points_wgs = build_population_density_samples(pop_sampler, route_bbox, max_points=3600)
+    population_tiles_template = ""
+    population_tiles_min_zoom = 0
+    population_tiles_max_native_zoom = 18
+    population_tiles_dir = Path(summary.get("outputs", {}).get("population", {}).get("tiles_dir", ""))
+    if population_tiles_dir.exists():
+        encoded_tiles_dir = parse.quote(population_tiles_dir.resolve().as_posix(), safe="/:")
+        population_tiles_template = f"file://{encoded_tiles_dir}" + "/{z}/{x}/{y}.png"
+        zoom_levels: List[int] = []
+        for sub in population_tiles_dir.iterdir():
+            if sub.is_dir() and str(sub.name).isdigit():
+                zoom_levels.append(int(str(sub.name)))
+        if zoom_levels:
+            population_tiles_min_zoom = min(zoom_levels)
+            population_tiles_max_native_zoom = max(zoom_levels)
+    dynamic_grb_xy = build_dynamic_grb_geometry(route_line_xy, profile_samples)
+    dynamic_grb_area_m2 = 0.0
+    if dynamic_grb_xy is not None and (not dynamic_grb_xy.is_empty):
+        try:
+            dynamic_grb_area_m2 = float(dynamic_grb_xy.area)
+        except Exception:
+            dynamic_grb_area_m2 = 0.0
     candidate_summary = []
     candidate_routes_wgs_for_html: List[Dict[str, Any]] = []
     result_by_id = {str(c["id"]): c for c in candidate_results}
@@ -4658,14 +6965,21 @@ def main() -> None:
         if cid not in result_by_id:
             continue
         cand = result_by_id[cid]
-        coords = [(lat, lon) for lon, lat in cand["route_nodes_wgs"]]
+        altitude_points = cand.get("altitude_points_wgs_alt") or []
+        coords = [(lat, lon) for lon, lat, _ in altitude_points] if altitude_points else [(lat, lon) for lon, lat in cand["route_nodes_wgs"]]
         show_flag = (cand["id"] == selected_candidate["id"])
         candidate_routes_wgs_for_html.append(
             {
                 "id": cand["id"],
                 "label": spec.label,
                 "coords": coords,
+                "alt_points": [
+                    (float(lon), float(lat), float(alt))
+                    for lon, lat, alt in altitude_points
+                ],
+                "profile_samples": cand.get("altitude_profile_samples") or [],
                 "distance_km": cand["distance_km"],
+                "route_buffer_xy": cand["route_buffer_xy"],
                 "show": show_flag,
             }
         )
@@ -4686,36 +7000,6 @@ def main() -> None:
                 "max_true_height_m": round(float(cand.get("max_true_height_m", 0.0)), 2),
                 "buffer_metrics": cand["buffer_metrics"],
                 "route_selection_strategy": cand["strategy"],
-            }
-        )
-    if str(selected_candidate.get("id", "")) not in core_candidate_ids:
-        selected_coords = [(lat, lon) for lon, lat in selected_candidate["route_nodes_wgs"]]
-        candidate_routes_wgs_for_html.append(
-            {
-                "id": selected_candidate["id"],
-                "label": f"Selected ({selected_candidate['id']})",
-                "coords": selected_coords,
-                "distance_km": selected_candidate["distance_km"],
-                "show": True,
-            }
-        )
-        candidate_summary.append(
-            {
-                "id": selected_candidate["id"],
-                "label": f"Selected ({selected_candidate['id']})",
-                "selected": True,
-                "profile_key": selected_candidate["profile_key"],
-                "distance_km": selected_candidate["distance_km"],
-                "detour_ratio_vs_direct": selected_candidate["detour_ratio"],
-                "water_share": selected_candidate["water_share"],
-                "turns_after_post_smooth": int(selected_candidate["turns_after"]),
-                "min_turn_angle_deg": float(selected_candidate.get("min_turn_angle_deg", 180.0)),
-                "vertical_energy_proxy_m": round(float(selected_candidate.get("vertical_energy_proxy_m", 0.0)), 2),
-                "total_climb_m": round(float(selected_candidate.get("total_climb_m", 0.0)), 2),
-                "total_descent_m": round(float(selected_candidate.get("total_descent_m", 0.0)), 2),
-                "max_true_height_m": round(float(selected_candidate.get("max_true_height_m", 0.0)), 2),
-                "buffer_metrics": selected_candidate["buffer_metrics"],
-                "route_selection_strategy": selected_candidate["strategy"],
             }
         )
     if candidate_failures:
@@ -4744,7 +7028,7 @@ def main() -> None:
         )
     pareto_payload = {
         "metrics": pareto_metric_keys,
-        "sweep_levels": int(args.weight_sweep_levels),
+        "sweep_levels": int(len(sweep_candidate_specs)),
         "evaluated_candidates": len(candidate_results),
         "pareto_front_size": len(pareto_front),
         "pareto_front": pareto_front_summary,
@@ -4767,19 +7051,31 @@ def main() -> None:
         candidate_routes_wgs=candidate_routes_wgs_for_html,
         start_wgs=start_wgs,
         end_wgs=end_wgs,
-        nofly_polys_xy=(nofly_hard_polys_xy + nofly_soft_polys_xy),
+        civil_airport_polys_xy=civil_airport_display_polys_xy,
+        military_hard_nofly_polys_xy=nofly_military_hard_polys_xy,
+        heli_soft_nofly_polys_xy=nofly_heli_soft_polys_xy,
         route_buffer_xy=route_buffer_xy,
+        dynamic_grb_xy=dynamic_grb_xy,
+        population_points_wgs=population_points_wgs,
+        population_tiles_template=population_tiles_template,
+        population_tiles_min_zoom=population_tiles_min_zoom,
+        population_tiles_max_native_zoom=population_tiles_max_native_zoom,
+        landuse_geoms_xy=landuse_geoms,
+        landuse_costs=landuse_costs,
+        all_building_polys_xy=b_geoms,
         high_building_polys_xy=high_building_polys_xy,
         crowd_points_xy=crowd_points_xy,
         key_points_xy=key_points_xy,
         infra_geoms_xy=infra_geoms,
         high_road_lines_xy=high_road_lines_xy,
         hsr_lines_xy=hsr_lines_xy,
+        hv_power_lines_xy=hv_power_lines_xy,
         line_risk_union_xy=line_risk_union_xy,
-        low_risk_landuse_xy=low_risk_landuse_xy,
         school_hard_zones_xy=school_hard_zones_xy,
         school_points_xy=school_points_xy,
-        profile_samples=profile_samples,
+        school_point_tooltips_xy=school_point_tooltips_xy,
+        crowd_point_tooltips_xy=crowd_point_tooltips_xy,
+        key_point_tooltips_xy=key_point_tooltips_xy,
         inv=inv,
         name=base_name,
     )
@@ -4806,7 +7102,8 @@ def main() -> None:
         "poi_risk_sources": poi_risk_counter,
         "school_kindergarten_sources": school_counter,
         "line_risk_sources": line_risk_counter,
-        "low_risk_landuse_sources": low_risk_counter,
+        "landuse_sources": landuse_display_counter,
+        "low_risk_landuse_sources": landuse_display_counter,
         "water_availability": {
             "long_water_available": bool(long_water_available),
             "water_total_len_km": round(water_total_len_m / 1000.0, 3),
@@ -4830,10 +7127,12 @@ def main() -> None:
         "buffer_metrics": {
             "buffer_m": ROUTE_BUFFER_M,
             "crowd_points_in_buffer": int(crowd_in_buffer),
-            "key_facility_points_in_buffer": int(key_in_buffer),
+            "sensitive_facility_points_in_buffer": int(sensitive_in_buffer),
+            "key_facility_points_in_buffer": int(sensitive_in_buffer),
             "critical_infra_geoms_in_buffer": int(infra_in_buffer),
             "line_risk_overlap_m": round(line_overlap_m, 2),
             "high_building_overlap_m": round(high_build_overlap_m, 2),
+            "dynamic_grb_area_m2": round(dynamic_grb_area_m2, 2),
         },
         "route_cost_base": route_cost_base,
         "route_cost_water_priority": route_cost_water,
@@ -4844,12 +7143,18 @@ def main() -> None:
             "climb_ms": args.climb_ms,
             "descend_ms": args.descend_ms,
             "turn_radius_m": args.turn_radius_m,
-            "clearance_m": args.clearance_m,
+            "clearance_m": float(effective_clearance_m),
+            "requested_clearance_m": float(args.clearance_m),
             "endpoint_true_height_m": args.endpoint_true_height_m,
             "min_true_height_m": args.min_true_height_m,
             "max_true_height_m": args.max_true_height_m,
             "preferred_cruise_max_m": args.preferred_cruise_max_m,
             "hard_ceiling_m": args.hard_ceiling_m,
+        },
+        "safety_hard_constraints": {
+            "sensitive_facility_buffer_m": float(args.safety_sensitive_hard_buffer_m),
+            "critical_infrastructure_buffer_m": float(args.safety_infra_hard_buffer_m),
+            "legacy_global_infra_buffer_m": float(args.infra_hard_buffer_m),
         },
         "route_postprocess": {
             "min_turn_keep_deg": float(args.min_turn_keep_deg),

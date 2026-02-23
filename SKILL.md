@@ -24,9 +24,11 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
 1. Builds a route graph from open data (roads + waterways).
    - Includes an oblique free-air lattice so planner can use low-risk straight air corridors instead of being locked to roads.
 2. Applies hard constraints:
-   - Open-data hard no-fly zones (airport and major military areas).
+   - Open-data hard no-fly zones:
+     - Civil airports use CAAC dataset (`config/civil_airport_no_fly.geojson`, converted from 民航机场禁飞区.xls).
+     - Military airport areas still come from OSM military tags.
    - Optional hard buffer around critical infrastructure.
-   - Minor military tags are treated as soft penalties by default.
+   - Schools/kindergartens use hard avoidance buffers; universities are excluded from school-sensitive hard constraints.
 3. Optimizes a risk-aware objective:
    - Distance
    - Population exposure (air-corridor crossing uses multi-point density sampling)
@@ -35,6 +37,8 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
    - Height-pressure proxy (buildings/obstacles)
    - Turning penalty (road-turn suppression with corrected angle model)
    - Waterway priority candidate (accepted when detour is within 10%)
+   - Linear risk crossing penalty includes highway / HSR / high-voltage power lines (`power=line|minor_line` with `voltage>=220kV`)
+   - Sensitive POI includes government + military facilities in key-facility penalties
    - Post-search corner reduction with population-aware shortcut checks
    - Low-yield bend pruning + optional waypoint budget control
 4. Plans altitude profile along the final path:
@@ -44,11 +48,15 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
    - Cruise-first profile strategy: uses route-top reference to keep long flat segments, then descends near destination when feasible
    - KML waypoint compression: straight/no-turn segments avoid dense point injection; extra points are kept only when needed for altitude/safety constraints
 5. Outputs KML/HTML/meta and can optionally run `workflow_v2`.
-6. Exports three explicit candidate layers in HTML:
-   - `1) 安全优先 + 水路偏好`
-   - `2) 安全优先（默认主航线）`
-   - `3) 效率优先`
-   You can toggle each in LayerControl.
+6. Exports two explicit route layers in HTML (no third "main route" layer):
+   - `安全优先（3D高度）` + `安全优先 缓冲区 100m`
+   - `效率优先（3D高度）` + `效率优先 缓冲区 100m`
+   Both are independently toggleable in LayerControl.
+7. Waypoint editor supports selecting the baseline route (`安全优先` / `效率优先`) before drag-editing and KML export.
+8. Vertical profile panel supports switching between `安全优先` and `效率优先` profile curves.
+9. Basemap high-zoom behavior is hardened:
+   - `普通地图` and `卫星影像` support high-zoom overzoom rendering.
+   - `卫星注记` follows the same high-zoom cap so labels remain consistent.
 
 ## Command
 
@@ -73,10 +81,10 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 ## Key options
 
 - `--profile`: `fastest | balanced | safest`
-- `--select-candidate`: `safety_water | safety_default | efficiency`
+- `--select-candidate`: `safety_default | efficiency`
   - default is `safety_default` (main output route remains safety-first by default)
 - `--top-k`: number of alternatives to export (current phase exports best route + candidate summary)
-- `--weight-sweep-levels`: generate extra sweep candidates between safety-default and efficiency for trade-off exploration
+- `--weight-sweep-levels`: deprecated in 2-candidate mode (accepted for compatibility but ignored)
 - `--pareto-select`: allow final selection from Pareto front (`distance_km`, `path_population_p90`, `vertical_energy_proxy_m`)
 - `--pareto-detour-limit-ratio`: optional override for max distance ratio allowed in Pareto switching
 - `--pareto-distance-weight`: optional override for distance weight in Pareto score
@@ -86,8 +94,11 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - `--pareto-policy-file`: optional policy JSON path (default `skills/plan-auto-route/config/pareto_policies.json`)
 - `--pareto-policy-name`: base policy name in policy JSON (default `default`)
 - `--pareto-business-line`: business-line override key (default `default`)
-- `--open-data-no-fly`: enable airport/heliport/military no-fly polygons from OSM/Overpass
+- `--open-data-no-fly`: enable no-fly filtering (civil airports from CAAC dataset + heliport/helipad/military from OSM/Overpass)
+- `--civil-airport-no-fly-geojson`: path to civil-airport no-fly dataset (default `skills/plan-auto-route/config/civil_airport_no_fly.geojson`)
 - `--soft-no-fly-scale`: adjust soft no-fly penalty strength (e.g., `0.6` more efficiency, `1.5` more conservative)
+- `--safety-sensitive-hard-buffer-m`: hard exclusion buffer around sensitive facilities for safety route
+- `--safety-infra-hard-buffer-m`: hard exclusion buffer around critical infrastructure for safety route
 - `--clearance-m`: minimum clearance above local top surface (terrain/building/obstacle)
 - `--endpoint-true-height-m`: start/end minimum true height above terrain (default `60m`; may climb higher for hard obstacle clearance)
 - `--min-true-height-m`: route true-height floor above terrain (default `60m`)
@@ -122,8 +133,10 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 ## Notes
 
 - This is phase-1 auto planner: OD automation + hard no-fly + risk-aware path + altitude envelope.
-- Open-data no-fly coverage depends on OSM completeness and should be verified before operations.
+- Civil-airport hard no-fly now depends on CAAC dataset geometry quality; military/heliport still depends on OSM completeness.
 - Overpass queries are cached in `output/overpass_cache` to improve reproducibility and reduce API jitter impact.
+- GIS city datasets are cache-first: planner checks local `output/city_data/<city>` completeness first, and only downloads missing data.
+- To regenerate the civil-airport dataset from XLS: run `python3 skills/plan-auto-route/scripts/build_civil_airport_no_fly_geojson.py --xls /Users/leonzhao/dailywork/民航机场禁飞区.xls`.
 - For regulated missions, keep SORA/JARUS compliance checks as a separate gate.
 - Current refactor keeps script backup at `skills/plan-auto-route/scripts/plan_auto_route_pre_refactor_backup.py`.
 - Built-in Pareto policy file: `skills/plan-auto-route/config/pareto_policies.json`.
@@ -148,7 +161,6 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
   --end-lon 114.1392 --end-lat 22.5017 \
   --name "sz_dense_policy" \
   --profile safest \
-  --weight-sweep-levels 4 \
   --pareto-select \
   --pareto-policy-name urban_dense
 ```
@@ -162,7 +174,6 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
   --end-lon 117.2110 --end-lat 31.8640 \
   --name "hf_suburban_policy" \
   --profile balanced \
-  --weight-sweep-levels 3 \
   --pareto-select \
   --pareto-policy-name suburban_logistics
 ```

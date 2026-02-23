@@ -46,7 +46,8 @@ export KML/HTML/meta/candidates_json
   - `--select-candidate safety_water|safety_default|efficiency`（最终输出选择哪条候选；默认 `safety_default`）
   - `--soft-no-fly-scale <float>`（软禁飞惩罚倍率：更小更偏效率、更大更保守）
 - 开源禁飞：
-  - `--open-data-no-fly`（启用机场/军用等 open-data 禁飞：硬/软分层）
+  - `--open-data-no-fly`（启用禁飞分层：民航机场来自 CAAC 数据集；军用/直升机场来自 OSM）
+  - `--civil-airport-no-fly-geojson`（民航机场禁飞数据，默认 `skills/plan-auto-route/config/civil_airport_no_fly.geojson`）
 - 飞行包线/净空：
   - `--clearance-m`（相对地形+建筑/障碍顶面净空）
   - `--min-true-height-m --max-true-height-m --endpoint-true-height-m`
@@ -94,17 +95,24 @@ export KML/HTML/meta/candidates_json
 - **交通网络**：`transport/roads_geojson`（道路）+ 其他交通图层（如高铁）
 - **POI**：`poi/...`（用于 crowd/key facility 的点风险）
 
-### 3.2 Overpass（按规划范围 bbox 拉取，可能被缓存）
+### 3.2 民航机场数据集（优先）
+
+- `skills/plan-auto-route/config/civil_airport_no_fly.geojson`
+  - 来源：`/Users/leonzhao/dailywork/民航机场禁飞区.xls`
+  - 用途：民航机场硬禁飞边界（替代 OSM civil airport）
+  - 生成脚本：`skills/plan-auto-route/scripts/build_civil_airport_no_fly_geojson.py`
+
+### 3.3 Overpass（按规划范围 bbox 拉取，可能被缓存）
 
 用于补齐/动态获取：
 
-- 开放数据禁飞：机场/直升机场/军用区（硬/软）
+- 开放数据禁飞补充：直升机场/直升机坪（软）与军用区（硬/软）
 - 学校/幼儿园：并加入“学校硬缓冲区”
 - 建筑与障碍：building、多种塔桅/电力设施等（高度代理、避让区）
 - 关键基础设施：电力/塔桅等（惩罚/硬缓冲）
-- 线性风险：高速/主干路、高铁等（`line_cross` 重叠惩罚）
+- 线性风险：高速/主干路、高铁、高压电力线（`power=line|minor_line` 且 `voltage>=220kV`，`line_cross` 重叠惩罚）
 
-### 3.3 DEM（地形）
+### 3.4 DEM（地形）
 
 - 优先本地 `--dem-tif`（GeoTIFF；采样地形高程）
 - 否则使用 OpenTopoData SRTM（网络接口，精度/稳定性依赖外部服务）
@@ -157,12 +165,12 @@ export KML/HTML/meta/candidates_json
 - 土地利用成本（Polygon cost）
 - 基础设施惩罚（距离/缓冲）
 - 建筑/障碍物高度代理（intersection/nearest）
-- POI 点风险（crowd / key facility）
+- POI 点风险（crowd / key facility；大学不计入 school-sensitive crowd）
 
 再结合线段与若干 union 区的**重叠比例**：
 
 - 软禁飞 overlap
-- 线性风险 overlap（高速/高铁缓冲）
+- 线性风险 overlap（高速/高铁/高压电力线缓冲）
 - 高楼避让区 overlap
 - 学校硬缓冲 overlap（并参与额外惩罚项）
 
@@ -182,9 +190,9 @@ export KML/HTML/meta/candidates_json
 | `infrastructure` | 高铁/电力/塔桅等 | 距离分段惩罚 + 统计分位 | 避开关键基础设施 |
 | `altitude` | 建筑/障碍 | `height_proxy`（采样混合） | 避开高楼/高障碍密集区（降低高度压力） |
 | `soft_no_fly` | open-data no-fly | overlap ratio | 尽量远离软禁飞 |
-| `crowd` | crowd POI | 点风险惩罚（inner/buffer 分段） | 避开学校/医院/商圈等 |
-| `key_facility` | 政府/警消等 | 点风险惩罚 | 避开敏感设施 |
-| `line_cross` | 高速/高铁缓冲 | overlap ratio | 降低线性风险区穿越 |
+| `crowd` | crowd POI | 点风险惩罚（inner/buffer 分段） | 避开学校/医院/商圈等（不含大学） |
+| `key_facility` | 政府/警消 + 军事设施 | 点风险惩罚 | 避开敏感设施 |
+| `line_cross` | 高速/高铁/高压电力线缓冲 | overlap ratio | 降低线性风险区穿越 |
 | `high_building` | 高楼 union | overlap ratio | 更强避开高楼密集区 |
 | `school_penalty_*` | 学校缓冲 | overlap ratio ×（air/ground 不同系数） | 对学校区域更强惩罚 |
 | `turn` | 搜索阶段 | 由 `_turn_penalty_for_vectors` 注入 | 减少急弯与小半径弯 |
@@ -350,6 +358,7 @@ export KML/HTML/meta/candidates_json
 - `turns_after_post_smooth`, `min_turn_angle_deg`
 - `vertical_energy_proxy_m`, `total_climb_m`, `total_descent_m`, `max_true_height_m`
 - `buffer_metrics`（crowd/key/infra 计数、line/high_build overlap）
+- `line_risk_sources`（`highway` / `hsr` / `high_voltage_power_line` 来源计数）
 - `route_selection_strategy`（可能包含 `+vertical_tradeoff`）
 
 ---
@@ -390,7 +399,7 @@ export KML/HTML/meta/candidates_json
 ```mermaid
 flowchart TD
   A["输入 OD (坐标/od-kml)"] --> B["加载城市缓存 (population/landuse/transport/poi)"]
-  B --> C["Overpass 拉取补充 (禁飞/学校/建筑/设施/线性风险)"]
+  B --> C["Overpass 拉取补充 (禁飞/学校/建筑/设施/线性风险含220kV电力线)"]
   B --> D["构建索引 (STRtree/GeoTIFF/union)"]
   C --> D
   D --> E["构图 build_navigation_graph: road/water + air lattice + 端点连通 + 硬约束过滤"]
