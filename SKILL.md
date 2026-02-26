@@ -34,6 +34,9 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
    - Population exposure (air-corridor crossing uses multi-point density sampling)
    - Landuse risk
    - Critical infrastructure proximity
+     - Includes P1/P2 categories from OSM:
+       - P1: `man_made=storage_tank|works|pipeline` (hazard tags increase severity)
+       - P2: `man_made=water_works|wastewater_plant|pumping_station`, `waterway=dam`, `power=substation|plant`
    - Height-pressure proxy (buildings/obstacles)
    - Turning penalty (road-turn suppression with corrected angle model)
    - Waterway priority candidate (accepted when detour is within 10%)
@@ -57,6 +60,10 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
 9. Basemap high-zoom behavior is hardened:
    - `普通地图` and `卫星影像` support high-zoom overzoom rendering.
    - `卫星注记` follows the same high-zoom cap so labels remain consistent.
+10. Supports minimal-change replanning with a reference route:
+   - Uses `--reference-kml` as baseline and adds deviation penalty in graph search.
+   - Enforces hard filters on detour ratio and mean offset vs reference route.
+   - Writes reference comparison metrics to candidate/meta outputs.
 
 ## Command
 
@@ -77,6 +84,8 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
   - `--start-lon --start-lat --end-lon --end-lat`
 - Or OD from KML endpoints:
   - `--od-kml /absolute/path/to/route.kml`
+- Optional reference route for minimal-change replanning:
+  - `--reference-kml /absolute/path/to/reference_route.kml`
 
 ## Key options
 
@@ -90,6 +99,11 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - `--pareto-distance-weight`: optional override for distance weight in Pareto score
 - `--pareto-pop-weight`: optional override for population p90 weight in Pareto score
 - `--pareto-energy-weight`: optional override for vertical energy weight in Pareto score
+- `--reference-kml`: optional reference KML for minimal-change replanning
+- `--reference-corridor-m`: normalization corridor for reference offset penalty
+- `--reference-deviation-weight`: global multiplier for reference deviation penalty
+- `--reference-max-detour-ratio`: hard filter for max distance ratio vs reference route
+- `--reference-max-mean-offset-m`: hard filter for max mean offset vs reference route
 - `--pareto-max-front`: max Pareto front entries kept in summary JSON
 - `--pareto-policy-file`: optional policy JSON path (default `skills/plan-auto-route/config/pareto_policies.json`)
 - `--pareto-policy-name`: base policy name in policy JSON (default `default`)
@@ -121,6 +135,9 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 ## Outputs
 
 - Route KML: `output/auto_routes/<name>.kml`
+- Candidate KMLs:
+  - `output/auto_routes/<name>_safety_default.kml`
+  - `output/auto_routes/<name>_efficiency.kml`
 - Preview map: `output/auto_routes/<name>.html`
 - Plan meta: `output/auto_routes/<name>_meta.json`
 - Candidate summary: `output/auto_routes/<name>_candidates.json`
@@ -129,6 +146,12 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - Snapshot manifest: `output/auto_routes/snapshots/<name>_snapshot.json`
 - Optional layered review HTML:
   `output/full-workflow-v2-auto-route/<name>/<name>_map.html`
+
+When `--reference-kml` is enabled, outputs also include:
+- `reference_mode_enabled`
+- `reference_route` summary in meta
+- candidate-level `detour_ratio_vs_reference`
+- candidate-level `mean_offset_to_reference_m` / `p90_offset_to_reference_m` / `max_offset_to_reference_m`
 
 ## Notes
 

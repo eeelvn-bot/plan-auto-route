@@ -109,7 +109,10 @@ export KML/HTML/meta/candidates_json
 - 开放数据禁飞补充：直升机场/直升机坪（软）与军用区（硬/软）
 - 学校/幼儿园：并加入“学校硬缓冲区”
 - 建筑与障碍：building、多种塔桅/电力设施等（高度代理、避让区）
-- 关键基础设施：电力/塔桅等（惩罚/硬缓冲）
+- 关键基础设施（惩罚/硬缓冲）：
+  - 电力与塔桅：`power=*`、`man_made=tower|mast|chimney|communications_tower`
+  - P1：`man_made=storage_tank|works|pipeline`（若 `content/substance/product` 命中高危关键词则提高严重度）
+  - P2：`man_made=water_works|wastewater_plant|pumping_station`、`waterway=dam`、`power=substation|plant`
 - 线性风险：高速/主干路、高铁、高压电力线（`power=line|minor_line` 且 `voltage>=220kV`，`line_cross` 重叠惩罚）
 
 ### 3.4 DEM（地形）
@@ -187,7 +190,7 @@ export KML/HTML/meta/candidates_json
 | `length` | 几何 | 常量项 | 更短更好 |
 | `population` | 人口栅格 | `pop_norm`（avg/p90/peak 混合后归一） | 避开人群密集区 |
 | `landuse` | landuse GeoJSON | `_landuse_cost(landuse_type)` 的采样平均 | 偏好水面/绿地，惩罚住宅/商用等 |
-| `infrastructure` | 高铁/电力/塔桅等 | 距离分段惩罚 + 统计分位 | 避开关键基础设施 |
+| `infrastructure` | 高铁/电力/塔桅 + P1/P2 关键基础设施 | 距离分段惩罚 + 统计分位 | 避开关键基础设施 |
 | `altitude` | 建筑/障碍 | `height_proxy`（采样混合） | 避开高楼/高障碍密集区（降低高度压力） |
 | `soft_no_fly` | open-data no-fly | overlap ratio | 尽量远离软禁飞 |
 | `crowd` | crowd POI | 点风险惩罚（inner/buffer 分段） | 避开学校/医院/商圈等（不含大学） |

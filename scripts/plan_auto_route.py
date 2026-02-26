@@ -106,6 +106,7 @@ WEIGHT_PROFILES = {
         "crowd": 1.0,
         "key_facility": 1.2,
         "line_cross": 2.2,
+        "reference_deviation": 0.0,
     },
     "balanced": {
         "length": 1.0,
@@ -118,6 +119,7 @@ WEIGHT_PROFILES = {
         "crowd": 1.8,
         "key_facility": 2.2,
         "line_cross": 4.0,
+        "reference_deviation": 0.0,
     },
     "safest": {
         "length": 1.1,
@@ -130,6 +132,7 @@ WEIGHT_PROFILES = {
         "crowd": 2.8,
         "key_facility": 3.4,
         "line_cross": 5.5,
+        "reference_deviation": 0.0,
     },
 }
 
@@ -1103,12 +1106,6 @@ def _item_to_index(item: Any, geoms: List[Any], geom_id_map: Dict[int, int]) -> 
     idx = geom_id_map.get(id(item))
     if idx is not None:
         return idx
-    for i, g in enumerate(geoms):
-        try:
-            if item.equals(g):
-                return i
-        except Exception:
-            continue
     return None
 
 
@@ -1134,6 +1131,7 @@ def _nearest_index_and_distance(
     geom,
     geoms: List[Any],
     geom_id_map: Dict[int, int],
+    point_distance_only: bool = False,
 ) -> Tuple[Optional[int], float]:
     if tree is None or not geoms:
         return None, float("inf")
@@ -1144,6 +1142,11 @@ def _nearest_index_and_distance(
     idx = _item_to_index(near, geoms, geom_id_map)
     if idx is None:
         return None, float("inf")
+    if point_distance_only:
+        try:
+            return idx, math.hypot(float(geom.x) - float(geoms[idx].x), float(geom.y) - float(geoms[idx].y))
+        except Exception:
+            pass
     return idx, geom.distance(geoms[idx])
 
 
@@ -1298,6 +1301,107 @@ def load_civil_airport_no_fly_zones(
             out.append(merged)
     stats["dataset_features_intersected"] = feature_hits
     stats["dataset_airports_intersected"] = len(out)
+    return out, stats
+
+
+def _normalize_city_token(name: str) -> str:
+    token = str(name or "").strip()
+    if not token:
+        return ""
+    token = re.split(r"[_/\\s]", token, maxsplit=1)[0].strip()
+    for suffix in ("市", "地区", "自治州", "盟", "州"):
+        if token.endswith(suffix) and len(token) > len(suffix):
+            token = token[: -len(suffix)]
+            break
+    return token
+
+
+def _extract_airport_city_tokens(airport_name: str) -> List[str]:
+    name = str(airport_name or "").strip()
+    if not name:
+        return []
+    raw_tokens = [x.strip() for x in re.split(r"[\\/、,，\\-\\s]+", name) if x.strip()]
+    out: List[str] = []
+    for t in raw_tokens:
+        nt = _normalize_city_token(t)
+        if nt:
+            out.append(nt)
+    return out
+
+
+def load_civil_airport_no_fly_zones_by_city(
+    city_name: str,
+    fwd,
+    dataset_geojson_path: str,
+) -> Tuple[List[Any], Dict[str, Any]]:
+    out: List[Any] = []
+    stats: Dict[str, Any] = {
+        "dataset_path": "",
+        "dataset_features_loaded": 0,
+        "dataset_features_matched_city": 0,
+        "dataset_airports_matched_city": 0,
+        "city_name_input": city_name,
+        "city_token": "",
+    }
+    city_token = _normalize_city_token(city_name)
+    stats["city_token"] = city_token
+    path = Path(dataset_geojson_path).resolve() if dataset_geojson_path else DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON
+    stats["dataset_path"] = str(path)
+    if not city_token or (not path.exists()):
+        return out, stats
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return out, stats
+    features = obj.get("features", []) if isinstance(obj, dict) else []
+    if not isinstance(features, list):
+        return out, stats
+    stats["dataset_features_loaded"] = len(features)
+    by_airport: Dict[str, List[Any]] = defaultdict(list)
+    feature_hits = 0
+    for idx, feat in enumerate(features):
+        if not isinstance(feat, dict):
+            continue
+        geom_obj = feat.get("geometry") or {}
+        props = feat.get("properties") or {}
+        airport_name = str(props.get("airport_name", "")).strip()
+        airport_tokens = _extract_airport_city_tokens(airport_name)
+        if not airport_tokens:
+            continue
+        if not any((city_token in t) or (t in city_token) for t in airport_tokens):
+            continue
+        airport_code = str(props.get("icao", "")).strip().upper() or f"feature_{idx + 1}"
+        try:
+            g_wgs = shape(geom_obj)
+        except Exception:
+            continue
+        if g_wgs.is_empty:
+            continue
+        try:
+            if not g_wgs.is_valid:
+                g_wgs = g_wgs.buffer(0)
+        except Exception:
+            continue
+        if g_wgs.is_empty:
+            continue
+        g_xy = _to_xy_geometry(g_wgs, fwd)
+        if g_xy is None:
+            continue
+        if g_xy.geom_type not in {"Polygon", "MultiPolygon"}:
+            continue
+        by_airport[airport_code].append(g_xy)
+        feature_hits += 1
+    for _, geoms in by_airport.items():
+        try:
+            merged = unary_union(geoms)
+        except Exception:
+            continue
+        if merged.is_empty:
+            continue
+        if merged.geom_type in {"Polygon", "MultiPolygon"}:
+            out.append(merged)
+    stats["dataset_features_matched_city"] = feature_hits
+    stats["dataset_airports_matched_city"] = len(out)
     return out, stats
 
 
@@ -1765,6 +1869,8 @@ def build_infrastructure_index(
 (
   nwr({south},{west},{north},{east})[power];
   nwr({south},{west},{north},{east})[man_made~"^(tower|mast|chimney|communications_tower)$"];
+  nwr({south},{west},{north},{east})[man_made~"^(storage_tank|works|pipeline|water_works|wastewater_plant|pumping_station)$"];
+  nwr({south},{west},{north},{east})[waterway=dam];
 );
 out geom tags;
 """.strip()
@@ -1772,6 +1878,43 @@ out geom tags;
         data = run_overpass(query, timeout=120)
     except Exception:
         data = {"elements": []}
+
+    def _hazard_hint(tags: Dict[str, Any]) -> bool:
+        # P1 hazard proxy from common OSM fields around industrial energy assets.
+        text = " ".join(
+            [
+                str(tags.get("content", "")).lower(),
+                str(tags.get("substance", "")).lower(),
+                str(tags.get("product", "")).lower(),
+                str(tags.get("industrial", "")).lower(),
+                str(tags.get("hazard", "")).lower(),
+                str(tags.get("hazard_type", "")).lower(),
+            ]
+        )
+        if not text.strip():
+            return False
+        keys = (
+            "fuel",
+            "gas",
+            "lng",
+            "lpg",
+            "oil",
+            "petrol",
+            "petroleum",
+            "diesel",
+            "gasoline",
+            "kerosene",
+            "chemical",
+            "chemicals",
+            "petrochemical",
+            "refinery",
+            "ammonia",
+            "hydrogen",
+            "toxic",
+            "hazardous",
+        )
+        return any(k in text for k in keys)
+
     for el in data.get("elements", []):
         tags = el.get("tags") or {}
         g_wgs = _geometry_from_overpass_element(el)
@@ -1782,19 +1925,47 @@ out geom tags;
             continue
         power = str(tags.get("power", "")).lower()
         man_made = str(tags.get("man_made", "")).lower()
+        waterway = str(tags.get("waterway", "")).lower()
+        hazard_hint = _hazard_hint(tags)
         sev = 1.3
-        if power in {"plant", "substation"}:
+        point_buffer_m = 20.0
+        line_buffer_m = 8.0
+        # P1 critical infrastructure categories.
+        if man_made == "storage_tank":
+            sev = 2.9 if hazard_hint else 2.4
+            point_buffer_m = 26.0
+            line_buffer_m = 14.0
+        elif man_made == "pipeline":
+            sev = 2.7 if hazard_hint else 2.2
+            point_buffer_m = 24.0
+            line_buffer_m = 16.0
+        elif man_made == "works":
+            sev = 2.6 if hazard_hint else 2.2
+            point_buffer_m = 24.0
+            line_buffer_m = 14.0
+        # P2 critical infrastructure categories.
+        elif man_made in {"water_works", "wastewater_plant", "pumping_station"}:
+            sev = 2.0
+            point_buffer_m = 24.0
+            line_buffer_m = 12.0
+        elif waterway == "dam":
             sev = 2.2
+            point_buffer_m = 28.0
+            line_buffer_m = 18.0
+        if power in {"plant", "substation"}:
+            sev = max(sev, 2.2)
+            point_buffer_m = max(point_buffer_m, 24.0)
+            line_buffer_m = max(line_buffer_m, 12.0)
         elif power in {"tower", "line"}:
-            sev = 1.8
+            sev = max(sev, 1.8)
         elif man_made in {"tower", "communications_tower", "chimney"}:
-            sev = 1.8
+            sev = max(sev, 1.8)
         if g_xy.geom_type == "Point":
-            g2 = g_xy.buffer(20.0)
+            g2 = g_xy.buffer(point_buffer_m)
         elif g_xy.geom_type in {"Polygon", "MultiPolygon"}:
             g2 = g_xy
         else:
-            g2 = g_xy.buffer(8.0)
+            g2 = g_xy.buffer(line_buffer_m)
         geoms.append(g2)
         severities.append(sev)
     tree = STRtree(geoms) if geoms else None
@@ -1811,10 +1982,11 @@ def landuse_cost_at_point(
     costs: List[float],
     tree: Optional[STRtree],
     geom_id_map: Dict[int, int],
+    point_geom: Optional[Any] = None,
 ) -> float:
     if tree is None:
         return 1.0
-    point = Point(pt_xy)
+    point = point_geom if point_geom is not None else Point(pt_xy)
     candidates = _tree_candidate_indices(tree, point, geoms, geom_id_map)
     best: Optional[float] = None
     for idx in candidates:
@@ -1834,11 +2006,25 @@ def infrastructure_penalty_at_point(
     severities: List[float],
     tree: Optional[STRtree],
     geom_id_map: Dict[int, int],
+    point_geom: Optional[Any] = None,
+    nearest_cache: Optional[Dict[Tuple[float, float], Tuple[Optional[int], float]]] = None,
+    nearest_cache_snap_m: float = 1.0,
 ) -> float:
     if tree is None or not geoms:
         return 0.0
-    point = Point(pt_xy)
-    idx, dist = _nearest_index_and_distance(tree, point, geoms, geom_id_map)
+    point = point_geom if point_geom is not None else Point(pt_xy)
+    idx: Optional[int] = None
+    dist = float("inf")
+    cache_key: Optional[Tuple[float, float]] = None
+    if nearest_cache is not None:
+        cache_key = _round_key(pt_xy, snap_m=nearest_cache_snap_m)
+        cached = nearest_cache.get(cache_key)
+        if cached is not None:
+            idx, dist = cached
+    if idx is None and not math.isfinite(dist):
+        idx, dist = _nearest_index_and_distance(tree, point, geoms, geom_id_map)
+        if nearest_cache is not None and cache_key is not None:
+            nearest_cache[cache_key] = (idx, dist)
     if idx is None or math.isinf(dist):
         return 0.0
     sev = severities[idx] if 0 <= idx < len(severities) else 1.0
@@ -1859,10 +2045,11 @@ def building_height_at_point(
     heights: List[float],
     tree: Optional[STRtree],
     geom_id_map: Dict[int, int],
+    point_geom: Optional[Any] = None,
 ) -> float:
     if tree is None:
         return 0.0
-    point = Point(pt_xy)
+    point = point_geom if point_geom is not None else Point(pt_xy)
     candidates = _tree_candidate_indices(tree, point, geoms, geom_id_map)
     best = 0.0
     for idx in candidates:
@@ -1879,11 +2066,25 @@ def obstacle_height_near_point(
     heights: List[float],
     tree: Optional[STRtree],
     geom_id_map: Dict[int, int],
+    point_geom: Optional[Any] = None,
+    nearest_cache: Optional[Dict[Tuple[float, float], Tuple[Optional[int], float]]] = None,
+    nearest_cache_snap_m: float = 1.0,
 ) -> float:
     if tree is None or not geoms:
         return 0.0
-    point = Point(pt_xy)
-    idx, dist = _nearest_index_and_distance(tree, point, geoms, geom_id_map)
+    point = point_geom if point_geom is not None else Point(pt_xy)
+    idx: Optional[int] = None
+    dist = float("inf")
+    cache_key: Optional[Tuple[float, float]] = None
+    if nearest_cache is not None:
+        cache_key = _round_key(pt_xy, snap_m=nearest_cache_snap_m)
+        cached = nearest_cache.get(cache_key)
+        if cached is not None:
+            idx, dist = cached
+    if idx is None and not math.isfinite(dist):
+        idx, dist = _nearest_index_and_distance(tree, point, geoms, geom_id_map)
+        if nearest_cache is not None and cache_key is not None:
+            nearest_cache[cache_key] = (idx, dist)
     if idx is None or dist > 40.0:
         return 0.0
     if 0 <= idx < len(heights):
@@ -1898,11 +2099,31 @@ def point_risk_penalty_at_point(
     geom_id_map: Dict[int, int],
     inner_m: float = 60.0,
     buffer_m: float = ROUTE_BUFFER_M,
+    point_geom: Optional[Any] = None,
+    nearest_cache: Optional[Dict[Tuple[float, float], Tuple[Optional[int], float]]] = None,
+    nearest_cache_snap_m: float = 1.0,
 ) -> float:
     if tree is None or not geoms:
         return 0.0
-    point = Point(pt_xy)
-    idx, dist = _nearest_index_and_distance(tree, point, geoms, geom_id_map)
+    point = point_geom if point_geom is not None else Point(pt_xy)
+    idx: Optional[int] = None
+    dist = float("inf")
+    cache_key: Optional[Tuple[float, float]] = None
+    if nearest_cache is not None:
+        cache_key = _round_key(pt_xy, snap_m=nearest_cache_snap_m)
+        cached = nearest_cache.get(cache_key)
+        if cached is not None:
+            idx, dist = cached
+    if idx is None and not math.isfinite(dist):
+        idx, dist = _nearest_index_and_distance(
+            tree,
+            point,
+            geoms,
+            geom_id_map,
+            point_distance_only=True,
+        )
+        if nearest_cache is not None and cache_key is not None:
+            nearest_cache[cache_key] = (idx, dist)
     if idx is None or math.isinf(dist):
         return 0.0
     if dist <= inner_m:
@@ -2021,6 +2242,22 @@ def _line_population_stats(seg_xy: LineString, pop_sampler: PopulationSampler, i
     return sum(vals) / len(vals), _percentile(vals, 0.9), max(vals)
 
 
+def _line_offset_stats(seg_xy: LineString, reference_line_xy: LineString) -> Tuple[float, float, float]:
+    if seg_xy.is_empty or reference_line_xy.is_empty:
+        return 0.0, 0.0, 0.0
+    vals: List[float] = []
+    if seg_xy.length < 1.0:
+        p = Point(seg_xy.coords[0])
+        d = float(p.distance(reference_line_xy))
+        return d, d, d
+    for r in _sample_ratios_for_segment(seg_xy.length):
+        p = seg_xy.interpolate(seg_xy.length * r)
+        vals.append(float(p.distance(reference_line_xy)))
+    if not vals:
+        return 0.0, 0.0, 0.0
+    return sum(vals) / len(vals), _percentile(vals, 0.9), max(vals)
+
+
 def build_navigation_graph(
     lines_xy: List[Dict[str, Any]],
     start_xy: Tuple[float, float],
@@ -2060,6 +2297,10 @@ def build_navigation_graph(
     line_risk_union_xy,
     high_building_union_xy,
     enable_water_endpoint_connectors: bool = True,
+    edge_feature_cache: Optional[Dict[Tuple[Tuple[float, float], Tuple[float, float], str], Dict[str, float]]] = None,
+    reference_line_xy: Optional[LineString] = None,
+    reference_corridor_m: float = 300.0,
+    reference_deviation_weight: float = 0.0,
 ) -> Tuple[
     Dict[Tuple[float, float], List[Tuple[Tuple[float, float], Dict[str, float], Tuple[float, float]]]],
     Dict[str, int],
@@ -2079,6 +2320,13 @@ def build_navigation_graph(
     high_building_union = (
         high_building_union_xy if high_building_union_xy is not None and (not high_building_union_xy.is_empty) else None
     )
+    reference_line = (
+        reference_line_xy
+        if reference_line_xy is not None and (not reference_line_xy.is_empty)
+        else None
+    )
+    ref_corridor = max(1.0, float(reference_corridor_m))
+    ref_dev_weight = max(0.0, float(reference_deviation_weight))
     skipped_nofly = 0
     skipped_infra_hard = 0
     skipped_school_hard = 0
@@ -2089,6 +2337,11 @@ def build_navigation_graph(
     lattice_nodes: set[Tuple[float, float]] = set()
     water_nodes: set[Tuple[float, float]] = set()
     edge_seen: set[Tuple[Tuple[float, float], Tuple[float, float], str]] = set()
+    feature_cache = edge_feature_cache if edge_feature_cache is not None else {}
+    infra_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
+    obstacle_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
+    crowd_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
+    key_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
 
     def canonical(p: Tuple[float, float]) -> Tuple[float, float]:
         k = _round_key(p, GRAPH_NODE_SNAP_M)
@@ -2096,7 +2349,7 @@ def build_navigation_graph(
             node_set[k] = k
         return node_set[k]
 
-    def edge_meta_for_segment(seg: LineString, ntype: str) -> Dict[str, float]:
+    def _edge_features_for_segment(seg: LineString, ntype: str) -> Dict[str, float]:
         a = seg.coords[0]
         b = seg.coords[-1]
         dist = float(seg.length)
@@ -2110,20 +2363,70 @@ def build_navigation_graph(
         for ratio in ratios:
             sx = a[0] * (1.0 - ratio) + b[0] * ratio
             sy = a[1] * (1.0 - ratio) + b[1] * ratio
+            point_xy = (sx, sy)
+            point_geom = Point(point_xy)
             lon, lat = xy_to_wgs(inv, sx, sy)
             pop_values.append(pop_sampler.sample(lon, lat))
-            land_samples.append(landuse_cost_at_point((sx, sy), landuse_geoms, landuse_costs, landuse_tree, landuse_id_map))
-            infra_samples.append(
-                infrastructure_penalty_at_point((sx, sy), infra_geoms, infra_severities, infra_tree, infra_id_map)
+            land_samples.append(
+                landuse_cost_at_point(
+                    point_xy,
+                    landuse_geoms,
+                    landuse_costs,
+                    landuse_tree,
+                    landuse_id_map,
+                    point_geom=point_geom,
+                )
             )
-            building_h = building_height_at_point((sx, sy), b_geoms, b_heights, b_tree, b_id_map)
-            obstacle_h = obstacle_height_near_point((sx, sy), o_geoms, o_heights, o_tree, o_id_map)
+            infra_samples.append(
+                infrastructure_penalty_at_point(
+                    point_xy,
+                    infra_geoms,
+                    infra_severities,
+                    infra_tree,
+                    infra_id_map,
+                    point_geom=point_geom,
+                    nearest_cache=infra_nearest_cache,
+                )
+            )
+            building_h = building_height_at_point(
+                point_xy,
+                b_geoms,
+                b_heights,
+                b_tree,
+                b_id_map,
+                point_geom=point_geom,
+            )
+            obstacle_h = obstacle_height_near_point(
+                point_xy,
+                o_geoms,
+                o_heights,
+                o_tree,
+                o_id_map,
+                point_geom=point_geom,
+                nearest_cache=obstacle_nearest_cache,
+            )
             height_samples.append(max(building_h, obstacle_h) / 50.0)
             crowd_samples.append(
-                point_risk_penalty_at_point((sx, sy), crowd_points_xy, crowd_tree, crowd_id_map, inner_m=50.0)
+                point_risk_penalty_at_point(
+                    point_xy,
+                    crowd_points_xy,
+                    crowd_tree,
+                    crowd_id_map,
+                    inner_m=50.0,
+                    point_geom=point_geom,
+                    nearest_cache=crowd_nearest_cache,
+                )
             )
             key_samples.append(
-                point_risk_penalty_at_point((sx, sy), key_points_xy, key_tree, key_id_map, inner_m=70.0)
+                point_risk_penalty_at_point(
+                    point_xy,
+                    key_points_xy,
+                    key_tree,
+                    key_id_map,
+                    inner_m=70.0,
+                    point_geom=point_geom,
+                    nearest_cache=key_nearest_cache,
+                )
             )
         pop_avg = sum(pop_values) / max(1, len(pop_values))
         pop_p90 = _percentile(pop_values, 0.9)
@@ -2156,6 +2459,38 @@ def build_navigation_graph(
             if land_samples
             else 0.0
         )
+        reference_dist_vals: List[float] = []
+        if reference_line is not None and ref_dev_weight > 0:
+            for ratio in ratios:
+                sx = a[0] * (1.0 - ratio) + b[0] * ratio
+                sy = a[1] * (1.0 - ratio) + b[1] * ratio
+                reference_dist_vals.append(float(Point(sx, sy).distance(reference_line)))
+        ref_mean = sum(reference_dist_vals) / len(reference_dist_vals) if reference_dist_vals else 0.0
+        ref_p90 = _percentile(reference_dist_vals, 0.9) if reference_dist_vals else 0.0
+        ref_norm = min(4.0, ref_mean / ref_corridor) if reference_dist_vals else 0.0
+        return {
+            "dist": dist,
+            "pop": pop_norm,
+            "land": land_cost,
+            "infra": infra_pen,
+            "height_proxy": height_proxy,
+            "soft_no_fly": soft_overlap,
+            "crowd_pen": crowd_pen,
+            "key_pen": key_pen,
+            "line_overlap": line_overlap,
+            "high_building_overlap": high_build_overlap,
+            "school_overlap": school_overlap,
+            "pop_p90": pop_p90,
+            "water_like_ratio": water_like_ratio,
+            "low_risk_land_ratio": low_risk_land_ratio,
+            "reference_mean_offset_m": ref_mean,
+            "reference_p90_offset_m": ref_p90,
+            "reference_dev_norm": ref_norm,
+            "network_type": ntype,
+        }
+
+    def _score_edge_features(features: Dict[str, float]) -> Dict[str, float]:
+        ntype = str(features.get("network_type", "road"))
         if ntype == "water":
             ground_mult = 0.52
             network_mult = 0.8
@@ -2165,6 +2500,9 @@ def build_navigation_graph(
         else:
             ground_mult = 0.72
             network_mult = 0.92
+        pop_p90 = float(features.get("pop_p90", 0.0))
+        low_risk_land_ratio = float(features.get("low_risk_land_ratio", 0.0))
+        water_like_ratio = float(features.get("water_like_ratio", 0.0))
         context_mult = 1.0
         if ntype == "air":
             if pop_p90 <= 120.0:
@@ -2181,36 +2519,26 @@ def build_navigation_graph(
             context_mult *= 1.18
         per_m = (
             weights["length"] * 1.0
-            + weights["population"] * pop_norm
-            + weights["landuse"] * land_cost * ground_mult
-            + weights["infrastructure"] * infra_pen
-            + weights["altitude"] * height_proxy
-            + weights["soft_no_fly"] * soft_overlap
-            + weights["crowd"] * crowd_pen
-            + weights["key_facility"] * key_pen
-            + weights["line_cross"] * line_overlap
-            + (school_penalty_air if ntype == "air" else school_penalty_ground) * school_overlap
+            + weights["population"] * float(features.get("pop", 0.0))
+            + weights["landuse"] * float(features.get("land", 1.0)) * ground_mult
+            + weights["infrastructure"] * float(features.get("infra", 0.0))
+            + weights["altitude"] * float(features.get("height_proxy", 0.0))
+            + weights["soft_no_fly"] * float(features.get("soft_no_fly", 0.0))
+            + weights["crowd"] * float(features.get("crowd_pen", 0.0))
+            + weights["key_facility"] * float(features.get("key_pen", 0.0))
+            + weights["line_cross"] * float(features.get("line_overlap", 0.0))
+            + weights.get("reference_deviation", 0.0)
+            * ref_dev_weight
+            * float(features.get("reference_dev_norm", 0.0))
+            + (school_penalty_air if ntype == "air" else school_penalty_ground)
+            * float(features.get("school_overlap", 0.0))
         ) * network_mult * context_mult
-        base_cost = dist * max(0.01, per_m)
-        return {
-            "dist": dist,
-            "base": base_cost,
-            "pop": pop_norm,
-            "land": land_cost,
-            "infra": infra_pen,
-            "height_proxy": height_proxy,
-            "soft_no_fly": soft_overlap,
-            "crowd_pen": crowd_pen,
-            "key_pen": key_pen,
-            "line_overlap": line_overlap,
-            "high_building_overlap": high_build_overlap,
-            "school_overlap": school_overlap,
-            "pop_p90": pop_p90,
-            "water_like_ratio": water_like_ratio,
-            "air_edge": 1.0 if ntype == "air" else 0.0,
-            "water_edge": 1.0 if ntype == "water" else 0.0,
-            "network_type": ntype,
-        }
+        dist = max(1e-6, float(features.get("dist", 1.0)))
+        scored = dict(features)
+        scored["base"] = dist * max(0.01, per_m)
+        scored["air_edge"] = 1.0 if ntype == "air" else 0.0
+        scored["water_edge"] = 1.0 if ntype == "water" else 0.0
+        return scored
 
     def try_add_edge(a: Tuple[float, float], b: Tuple[float, float], ntype: str) -> bool:
         nonlocal kept_edges, skipped_nofly, skipped_infra_hard, skipped_school_hard, skipped_sensitive_hard, air_edges, min_base_per_m
@@ -2234,7 +2562,11 @@ def build_navigation_graph(
         if sensitive_hard is not None and seg.intersects(sensitive_hard):
             skipped_sensitive_hard += 1
             return False
-        meta = edge_meta_for_segment(seg, ntype=ntype)
+        meta = feature_cache.get(edge_key)
+        if meta is None:
+            meta = _edge_features_for_segment(seg, ntype=ntype)
+            feature_cache[edge_key] = meta
+        meta = _score_edge_features(meta)
         dist_m = max(1e-6, float(meta.get("dist", 1.0)))
         min_base_per_m = min(min_base_per_m, float(meta.get("base", dist_m)) / dist_m)
         vector_ab = (b[0] - a[0], b[1] - a[1])
@@ -5987,6 +6319,35 @@ def main() -> None:
     parser.add_argument("--end-lon", type=float, default=None)
     parser.add_argument("--end-lat", type=float, default=None)
     parser.add_argument("--od-kml", default="", help="Optional KML. Use first and last points as OD.")
+    parser.add_argument(
+        "--reference-kml",
+        default="",
+        help="Optional reference route KML for minimal-change replanning bias.",
+    )
+    parser.add_argument(
+        "--reference-corridor-m",
+        type=float,
+        default=300.0,
+        help="Offset normalization corridor (meters) for reference-route deviation penalty.",
+    )
+    parser.add_argument(
+        "--reference-deviation-weight",
+        type=float,
+        default=1.4,
+        help="Global multiplier for reference-route deviation penalty.",
+    )
+    parser.add_argument(
+        "--reference-max-detour-ratio",
+        type=float,
+        default=1.2,
+        help="Hard filter: max candidate distance ratio versus reference route length.",
+    )
+    parser.add_argument(
+        "--reference-max-mean-offset-m",
+        type=float,
+        default=180.0,
+        help="Hard filter: max mean offset distance (meters) versus reference route.",
+    )
     parser.add_argument("--name", default="auto_route", help="Output route base name.")
     parser.add_argument("--city-zoom", default="8-14")
     parser.add_argument("--profile", choices=["fastest", "balanced", "safest"], default="balanced")
@@ -6213,6 +6574,7 @@ def main() -> None:
     effective_clearance_m = max(30.0, float(args.clearance_m))
 
     root = Path(__file__).resolve().parents[3]
+    reference_points_wgs: List[Tuple[float, float]] = []
     if args.od_kml:
         od_coords = parse_kml_coords(Path(args.od_kml).resolve())
         start_wgs = (od_coords[0][0], od_coords[0][1])
@@ -6223,6 +6585,11 @@ def main() -> None:
             raise ValueError("Provide either --od-kml or full OD coordinates.")
         start_wgs = (float(args.start_lon), float(args.start_lat))
         end_wgs = (float(args.end_lon), float(args.end_lat))
+    if args.reference_kml:
+        ref_coords = parse_kml_coords(Path(args.reference_kml).resolve())
+        reference_points_wgs = [(float(lon), float(lat)) for lon, lat, _ in ref_coords]
+        if len(reference_points_wgs) < 2:
+            raise ValueError("--reference-kml must contain at least two coordinates.")
 
     ensure_city_data(root, args.city, args.city_zoom)
     cache_dir = _find_city_cache_dir(root, args.city)
@@ -6233,11 +6600,20 @@ def main() -> None:
         raise FileNotFoundError(f"download_summary.json missing for city: {args.city}")
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
-    fwd, inv = build_projectors([start_wgs, end_wgs])
+    projector_points = [start_wgs, end_wgs] + reference_points_wgs
+    fwd, inv = build_projectors(projector_points)
     start_xy = wgs_to_xy(fwd, start_wgs[0], start_wgs[1])
     end_xy = wgs_to_xy(fwd, end_wgs[0], end_wgs[1])
-    route_bbox = route_bbox_wgs([start_wgs, end_wgs], margin_m=4500.0)
-    route_bbox_building = route_bbox_wgs([start_wgs, end_wgs], margin_m=2800.0)
+    bbox_points = reference_points_wgs if len(reference_points_wgs) >= 2 else [start_wgs, end_wgs]
+    route_bbox = route_bbox_wgs(bbox_points, margin_m=4500.0)
+    route_bbox_building = route_bbox_wgs(bbox_points, margin_m=2800.0)
+    reference_line_xy = None
+    reference_length_m = 0.0
+    if len(reference_points_wgs) >= 2:
+        reference_xy = [wgs_to_xy(fwd, lon, lat) for lon, lat in reference_points_wgs]
+        reference_line_xy = LineString(reference_xy)
+        reference_length_m = float(reference_line_xy.length)
+    reference_mode = reference_line_xy is not None and reference_length_m > 0
 
     pop_tif = Path(summary.get("outputs", {}).get("population", {}).get("clipped_tif", ""))
     pop_sampler = PopulationSampler(pop_tif if pop_tif.exists() else None)
@@ -6300,9 +6676,20 @@ def main() -> None:
             fwd,
             dataset_geojson_path=args.civil_airport_no_fly_geojson,
         )
+        civil_airport_city_all_polys_xy, civil_city_match_stats = load_civil_airport_no_fly_zones_by_city(
+            args.city,
+            fwd,
+            dataset_geojson_path=args.civil_airport_no_fly_geojson,
+        )
+        if civil_airport_city_all_polys_xy:
+            # Standard behavior: always include city-level civil airport no-fly zones
+            # even when the route/data bbox is a local corridor crop.
+            nofly_hard_polys_xy.extend(civil_airport_city_all_polys_xy)
+            civil_airport_display_polys_xy.extend(civil_airport_city_all_polys_xy)
         if not civil_airport_display_polys_xy:
             civil_airport_display_polys_xy = list(civil_airport_route_scope_polys_xy)
         nofly_counter["civil_dataset_city_scope"] = civil_city_stats
+        nofly_counter["civil_dataset_city_match"] = civil_city_match_stats
     nofly_hard_union_xy = unary_union(nofly_hard_polys_xy) if nofly_hard_polys_xy else None
     nofly_soft_union_xy = unary_union(nofly_soft_polys_xy) if nofly_soft_polys_xy else None
     if nofly_hard_union_xy is not None and (not nofly_hard_union_xy.is_empty):
@@ -6414,6 +6801,7 @@ def main() -> None:
         and water_near_start_m <= 520.0
         and water_near_end_m <= 520.0
     )
+    edge_feature_cache: Dict[Tuple[Tuple[float, float], Tuple[float, float], str], Dict[str, float]] = {}
 
     def _solve_scheme(
         scheme_id: str,
@@ -6454,6 +6842,7 @@ def main() -> None:
             if wk in local_weights:
                 local_weights[wk] = max(0.01, float(local_weights[wk]) * float(sv))
         local_weights["soft_no_fly"] = max(0.0, local_weights["soft_no_fly"] * float(args.soft_no_fly_scale))
+        local_weights["reference_deviation"] = 1.0 if reference_mode else 0.0
         graph_local, graph_stats_local = build_navigation_graph(
             networks_xy,
             start_xy,
@@ -6493,6 +6882,10 @@ def main() -> None:
             line_risk_union_xy=line_risk_union_xy,
             high_building_union_xy=high_building_union_xy,
             enable_water_endpoint_connectors=enable_water_connectors,
+            edge_feature_cache=edge_feature_cache,
+            reference_line_xy=reference_line_xy,
+            reference_corridor_m=float(args.reference_corridor_m),
+            reference_deviation_weight=float(args.reference_deviation_weight),
         )
         start_node = _round_key(start_xy, GRAPH_NODE_SNAP_M)
         end_node = _round_key(end_xy, GRAPH_NODE_SNAP_M)
@@ -6760,6 +7153,12 @@ def main() -> None:
             float(solved["route_cost"].get("water_distance_m", 0.0)) / max(1e-6, float(solved["route_cost"].get("distance_m", 0.0))),
             3,
         )
+        if reference_line_xy is not None and reference_length_m > 0:
+            off_mean, off_p90, off_max = _line_offset_stats(solved["route_line_xy"], reference_line_xy)
+            solved["mean_offset_to_reference_m"] = round(float(off_mean), 2)
+            solved["p90_offset_to_reference_m"] = round(float(off_p90), 2)
+            solved["max_offset_to_reference_m"] = round(float(off_max), 2)
+            solved["detour_ratio_vs_reference"] = round(route_len_m / max(1e-6, reference_length_m), 3)
         pop_avg, pop_p90, pop_max = _line_population_stats(solved["route_line_xy"], pop_sampler, inv)
         solved["path_population_avg"] = round(pop_avg, 2)
         solved["path_population_p90"] = round(pop_p90, 2)
@@ -6810,6 +7209,40 @@ def main() -> None:
     if not candidate_results:
         raise RuntimeError(f"No feasible route after altitude constraints: {candidate_failures}")
 
+    if reference_mode:
+        max_ref_detour = max(1.0, float(args.reference_max_detour_ratio))
+        max_ref_mean_offset = max(0.0, float(args.reference_max_mean_offset_m))
+        filtered_ref: List[Dict[str, Any]] = []
+        for cand in candidate_results:
+            detour_ref = float(cand.get("detour_ratio_vs_reference", cand.get("detour_ratio", 999.0)))
+            mean_offset = float(cand.get("mean_offset_to_reference_m", 1e9))
+            if detour_ref > max_ref_detour + 1e-9:
+                candidate_failures.append(
+                    {
+                        "id": cand.get("id", "unknown"),
+                        "error": (
+                            f"reference_detour_exceeded: detour_ratio_vs_reference={detour_ref:.3f} "
+                            f"> limit={max_ref_detour:.3f}"
+                        ),
+                    }
+                )
+                continue
+            if mean_offset > max_ref_mean_offset + 1e-9:
+                candidate_failures.append(
+                    {
+                        "id": cand.get("id", "unknown"),
+                        "error": (
+                            f"reference_mean_offset_exceeded: mean_offset={mean_offset:.2f}m "
+                            f"> limit={max_ref_mean_offset:.2f}m"
+                        ),
+                    }
+                )
+                continue
+            filtered_ref.append(cand)
+        candidate_results = filtered_ref
+        if not candidate_results:
+            raise RuntimeError(f"No feasible route after reference constraints: {candidate_failures}")
+
     pareto_metric_keys = ["distance_km", "path_population_p90", "vertical_energy_proxy_m"]
     pareto_front = pareto_front_candidates(candidate_results, metric_keys=pareto_metric_keys)
     pareto_policy, pareto_policy_trace = resolve_pareto_policy(
@@ -6830,20 +7263,33 @@ def main() -> None:
     pareto_energy_weight = max(0.05, _safe_float(pareto_policy.get("energy_weight", args.vertical_energy_weight), 1.25))
 
     selected_candidate = None
-    for c in candidate_results:
-        if c["id"] == args.select_candidate:
-            selected_candidate = c
-            break
-    if selected_candidate is None:
-        # Fallback to existing default behavior for robustness.
+    if reference_mode:
+        candidate_results = sorted(
+            candidate_results,
+            key=lambda c: (
+                float(c.get("mean_offset_to_reference_m", 1e9)),
+                float(c.get("detour_ratio_vs_reference", 1e9)),
+                float(c.get("path_population_p90", 1e9)),
+                float(c.get("vertical_energy_proxy_m", 1e9)),
+            ),
+        )
+        selected_candidate = candidate_results[0]
+        selected_candidate["strategy"] = f"{selected_candidate.get('strategy', 'base')}+reference_min_change"
+    else:
         for c in candidate_results:
-            if c["id"] == "safety_default":
+            if c["id"] == args.select_candidate:
                 selected_candidate = c
                 break
-    if selected_candidate is None:
-        selected_candidate = candidate_results[0]
+        if selected_candidate is None:
+            # Fallback to existing default behavior for robustness.
+            for c in candidate_results:
+                if c["id"] == "safety_default":
+                    selected_candidate = c
+                    break
+        if selected_candidate is None:
+            selected_candidate = candidate_results[0]
 
-    if args.pareto_select and pareto_front:
+    if (not reference_mode) and args.pareto_select and pareto_front:
         base = selected_candidate
         base_dist = max(1e-6, _safe_float(base.get("distance_km", 0.0), 0.0))
         base_pop = max(1e-6, _safe_float(base.get("path_population_p90", 0.0), 0.0))
@@ -6868,7 +7314,7 @@ def main() -> None:
             best["strategy"] = f"{best.get('strategy', 'base')}+pareto_select"
             selected_candidate = best
 
-    if args.vertical_tradeoff and len(candidate_results) > 1:
+    if (not reference_mode) and args.vertical_tradeoff and len(candidate_results) > 1:
         base = selected_candidate
         base_dist = max(1e-6, float(base.get("distance_km", 0.0)))
         base_energy = max(1e-6, float(base.get("vertical_energy_proxy_m", 0.0)))
@@ -6960,6 +7406,14 @@ def main() -> None:
     candidate_summary = []
     candidate_routes_wgs_for_html: List[Dict[str, Any]] = []
     result_by_id = {str(c["id"]): c for c in candidate_results}
+    candidate_kml_outputs: Dict[str, str] = {}
+    for cid, cand in result_by_id.items():
+        alt_points = cand.get("altitude_points_wgs_alt") or []
+        if not alt_points:
+            continue
+        cand_kml_out = out_dir / f"{base_name}_{cid}.kml"
+        write_kml_absolute(cand_kml_out, alt_points, f"{base_name}_{cid}")
+        candidate_kml_outputs[cid] = str(cand_kml_out)
     for spec in core_candidate_specs:
         cid = spec.id
         if cid not in result_by_id:
@@ -6991,6 +7445,10 @@ def main() -> None:
                 "profile_key": cand["profile_key"],
                 "distance_km": cand["distance_km"],
                 "detour_ratio_vs_direct": cand["detour_ratio"],
+                "detour_ratio_vs_reference": cand.get("detour_ratio_vs_reference", None),
+                "mean_offset_to_reference_m": cand.get("mean_offset_to_reference_m", None),
+                "p90_offset_to_reference_m": cand.get("p90_offset_to_reference_m", None),
+                "max_offset_to_reference_m": cand.get("max_offset_to_reference_m", None),
                 "water_share": cand["water_share"],
                 "turns_after_post_smooth": int(cand["turns_after"]),
                 "min_turn_angle_deg": float(cand.get("min_turn_angle_deg", 180.0)),
@@ -6998,6 +7456,7 @@ def main() -> None:
                 "total_climb_m": round(float(cand.get("total_climb_m", 0.0)), 2),
                 "total_descent_m": round(float(cand.get("total_descent_m", 0.0)), 2),
                 "max_true_height_m": round(float(cand.get("max_true_height_m", 0.0)), 2),
+                "kml": candidate_kml_outputs.get(cid, ""),
                 "buffer_metrics": cand["buffer_metrics"],
                 "route_selection_strategy": cand["strategy"],
             }
@@ -7095,6 +7554,21 @@ def main() -> None:
         "planned_km": round(route_len_km, 3),
         "direct_km": round(direct_km, 3),
         "detour_ratio_vs_direct": round(route_len_km / max(1e-6, direct_km), 3),
+        "reference_mode_enabled": bool(reference_mode),
+        "reference_route": {
+            "kml": str(Path(args.reference_kml).resolve()) if args.reference_kml else "",
+            "length_km": round(reference_length_m / 1000.0, 3) if reference_mode else None,
+            "detour_ratio_vs_reference": round(route_line_xy.length / max(1e-6, reference_length_m), 3)
+            if reference_mode
+            else None,
+            "mean_offset_to_reference_m": selected_candidate.get("mean_offset_to_reference_m", None),
+            "p90_offset_to_reference_m": selected_candidate.get("p90_offset_to_reference_m", None),
+            "max_offset_to_reference_m": selected_candidate.get("max_offset_to_reference_m", None),
+            "corridor_m": float(args.reference_corridor_m),
+            "deviation_weight": float(args.reference_deviation_weight),
+            "max_detour_ratio": float(args.reference_max_detour_ratio),
+            "max_mean_offset_m": float(args.reference_max_mean_offset_m),
+        },
         "waypoints_xy": len(route_nodes),
         "open_data_no_fly_enabled": bool(args.open_data_no_fly),
         "no_fly_sources": nofly_counter,
@@ -7177,6 +7651,7 @@ def main() -> None:
         "altitude_profile_samples": profile_samples,
         "outputs": {
             "kml": str(kml_out),
+            "candidate_kmls": candidate_kml_outputs,
             "preview_html": str(html_out),
             "candidates_json": str(cand_out),
             "pareto_json": str(pareto_out),
@@ -7224,6 +7699,7 @@ def main() -> None:
                 dem_tif = Path(args.dem_tif).resolve() if args.dem_tif else None
                 outputs_snapshot = {
                     "kml": str(kml_out),
+                    "candidate_kmls": candidate_kml_outputs,
                     "preview_html": str(html_out),
                     "meta_json": str(meta_out),
                     "candidates_json": str(cand_out),
@@ -7251,6 +7727,8 @@ def main() -> None:
 
     print("DONE")
     print(f"KML: {kml_out}")
+    for cid in sorted(candidate_kml_outputs.keys()):
+        print(f"Candidate KML ({cid}): {candidate_kml_outputs[cid]}")
     print(f"Preview HTML: {html_out}")
     print(f"Meta: {meta_out}")
     print(f"Candidates: {cand_out}")
