@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import bisect
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -16,7 +15,6 @@ import numbers
 import re
 import subprocess
 import time
-import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -27,7 +25,7 @@ from folium.plugins import HeatMap
 import pyproj
 from osgeo import gdal
 from shapely.geometry import LineString, Point, Polygon, shape
-from shapely.ops import nearest_points, substring, transform, unary_union
+from shapely.ops import substring, transform, unary_union
 from shapely.strtree import STRtree
 
 try:
@@ -48,7 +46,7 @@ DEFAULT_OVERPASS_ENDPOINTS = [
 ]
 
 DEFAULT_OPENTOPO_ENDPOINT = "https://api.opentopodata.org/v1/srtm90m"
-ALGORITHM_VERSION = "plan-auto-route-latest-air-corridor-v4-refactor-landuse-softnofly-astarfix-existing-route-3d-avoid"
+ALGORITHM_VERSION = "plan-auto-route-latest-air-corridor-v4-refactor-landuse-softnofly-astarfix"
 OVERPASS_CACHE_DIR = Path(__file__).resolve().parents[3] / "output" / "overpass_cache"
 DEFAULT_PARETO_POLICY_FILE = Path(__file__).resolve().parents[1] / "config" / "pareto_policies.json"
 DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON = Path(__file__).resolve().parents[1] / "config" / "civil_airport_no_fly.geojson"
@@ -88,26 +86,6 @@ ENDPOINT_TRUE_HEIGHT_M = 60.0
 VERTICAL_DESCEND_ENERGY_FACTOR = 0.65
 CRUISE_BASE_QUANTILE = 0.22
 CRUISE_SOFT_CAP_RELAX_M = 2.0
-CRUISE_MSL_HOLD_TOL_M = 5.0
-LOW_ALT_DESCENT_COMMIT_M = 9.0
-LOW_ALT_DESCENT_LOOKAHEAD_M = 420.0
-LOW_ALT_STEP_HOLD_M = 2.0
-LOW_ALT_CLIMB_COMMIT_M = 6.0
-LOW_ALT_CLIMB_LOOKAHEAD_M = 520.0
-LOW_ALT_CLIMB_MARGIN_M = 80.0
-ALT_PLATEAU_LEVEL_TOL_M = 0.25
-ALT_PLATEAU_MIN_LEN_M = 120.0
-ALT_PLATEAU_SMALL_STEP_M = 3.0
-ALT_STAIRCASE_FLATTEN_MAX_STEP_M = 20.0
-ALT_TERMINAL_DESCENT_MAX_SPAN_M = 10.0
-ALT_TERMINAL_DESCENT_MIN_LEN_M = 240.0
-ALT_INTEGER_PLATEAU_SNAP_TOL_M = 0.25
-ALT_DESCENDING_BRIDGE_STEP_M = 3.0
-ALT_DESCENDING_BRIDGE_MAX_LEN_M = 1200.0
-ALT_ASCENDING_BRIDGE_STEP_M = 6.0
-ALT_ASCENDING_BRIDGE_MAX_LEN_M = 5000.0
-ALT_ASCENDING_PLATEAU_START_MAX_STEP_M = 6.0
-ALT_ASCENDING_PLATEAU_START_MIN_LEN_M = 180.0
 
 TURN_IGNORE_DEG = 14.0
 TURN_SHARP_DEG = 95.0
@@ -116,38 +94,8 @@ LOW_VALUE_TURN_KEEP_DEG = 26.0
 SHORTCUT_MAX_LEN_RATIO = 1.01
 ALT_PROFILE_SPACING_M = 25.0
 ALT_PROFILE_LINK_ERR_TOL_M = 1.8
-EXISTING_ROUTE_HORIZONTAL_BUFFER_M = 30.0
-EXISTING_ROUTE_VERTICAL_BUFFER_M = 20.0
-EXISTING_ROUTE_ENDPOINT_RELIEF_M = 200.0
-EXISTING_ROUTE_ALT_CLEARANCE_EPS_M = 0.5
-EXISTING_ROUTE_LAYER_MAX_ITEMS = 1500
-EXISTING_ROUTE_PROFILE_MARKER_SEARCH_M = 120.0
-EXISTING_ROUTE_PROFILE_MARKER_SEG_GAP_M = 80.0
-EXISTING_ROUTE_PROFILE_MARKER_MAX_POINTS = 36
 QUALITY_SEGMENT_LEN_M = 500.0
 QUALITY_STALE_DAYS = 90.0
-EMERGENCY_ROUTE_SEGMENT_LEN_M = 3000.0
-EMERGENCY_ROUTE_MAX_BRANCH_M = 500.0
-EMERGENCY_ROUTE_SEARCH_RADIUS_M = 900.0
-EMERGENCY_ROUTE_MIN_SPACING_M = 1500.0
-EMERGENCY_ROUTE_TERMINAL_MAX_TRUE_HEIGHT_M = 60.0
-EMERGENCY_ROUTE_MIN_FORK_INTERIOR_ANGLE_DEG = 120.0
-EMERGENCY_ROUTE_ANCHOR_STEP_M = 250.0
-EMERGENCY_ROUTE_MAX_CANDIDATES_PER_ANCHOR = 8
-HUMANIZE_PARALLEL_HEADING_GAP_DEG = 18.0
-HUMANIZE_BRIDGE_MIN_DEFLECTION_DEG = 18.0
-HUMANIZE_BRIDGE_MAX_DEFLECTION_DEG = 62.0
-HUMANIZE_MIN_ANCHOR_M = 260.0
-HUMANIZE_MIN_RESIDUAL_M = 120.0
-HUMANIZE_MAX_BRIDGE_M = 1800.0
-HUMANIZE_SLIDE_FRACTIONS = (0.18, 0.28, 0.38, 0.48, 0.58)
-HUMANIZE_SHORT_SEGMENT_MAX_M = 165.0
-HUMANIZE_SHORT_SEGMENT_HEADING_GAP_DEG = 16.0
-HUMANIZE_COLLINEAR_HEADING_GAP_DEG = 5.0
-HUMANIZE_COLLINEAR_SHORT_MAX_M = 180.0
-HUMANIZE_ALTITUDE_LATERAL_TOL_M = 10.0
-HUMANIZE_ALTITUDE_INTERP_TOL_M = 4.5
-HUMANIZE_ALTITUDE_LINK_ERR_TOL_M = 4.0
 QUALITY_SOURCE_CEILINGS = {
     "dem": 0.85,
     "building_obstacle": 0.80,
@@ -497,509 +445,6 @@ def parse_kml_coords(kml_path: Path) -> List[Tuple[float, float, float]]:
     if len(out) < 2:
         raise ValueError(f"Need at least two coordinates in KML: {kml_path}")
     return out
-
-
-def _polyline_cumulative_dist(points_xy: List[Tuple[float, float]]) -> List[float]:
-    if not points_xy:
-        return [0.0]
-    out = [0.0]
-    for i in range(1, len(points_xy)):
-        out.append(out[-1] + math.hypot(points_xy[i][0] - points_xy[i - 1][0], points_xy[i][1] - points_xy[i - 1][1]))
-    return out
-
-
-def _interp_alt_from_cum_dist(cum_dist_m: List[float], alts_m: List[float], dist_m: float) -> float:
-    if not cum_dist_m or not alts_m:
-        return 0.0
-    if len(cum_dist_m) == 1 or len(alts_m) == 1:
-        return float(alts_m[0])
-    d = min(max(0.0, float(dist_m)), float(cum_dist_m[-1]))
-    idx = bisect.bisect_left(cum_dist_m, d)
-    if idx <= 0:
-        return float(alts_m[0])
-    if idx >= len(cum_dist_m):
-        return float(alts_m[-1])
-    d0 = float(cum_dist_m[idx - 1])
-    d1 = float(cum_dist_m[idx])
-    z0 = float(alts_m[idx - 1])
-    z1 = float(alts_m[idx])
-    if d1 <= d0 + 1e-9:
-        return z1
-    t = (d - d0) / (d1 - d0)
-    return z0 * (1.0 - t) + z1 * t
-
-
-def load_existing_route_kmls_from_dir(kml_dir: Path) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
-    directory = kml_dir.expanduser().resolve()
-    if not directory.exists():
-        raise FileNotFoundError(f"Existing routes directory not found: {directory}")
-    if not directory.is_dir():
-        raise NotADirectoryError(f"Existing routes path is not a directory: {directory}")
-
-    files = sorted(directory.glob("*.kml"))
-    loaded_routes: List[Dict[str, Any]] = []
-    failed_files: List[Dict[str, str]] = []
-    for kml_file in files:
-        try:
-            points_wgs_alt = parse_kml_coords(kml_file)
-        except Exception as exc:
-            failed_files.append({"file": str(kml_file), "error": str(exc)})
-            continue
-        if len(points_wgs_alt) < 2:
-            failed_files.append({"file": str(kml_file), "error": "need at least two coordinates"})
-            continue
-        loaded_routes.append(
-            {
-                "file": str(kml_file),
-                "name": kml_file.stem,
-                "points_wgs_alt": [(float(lon), float(lat), float(alt)) for lon, lat, alt in points_wgs_alt],
-            }
-        )
-    stats = {
-        "directory": str(directory),
-        "files_total": int(len(files)),
-        "loaded_files": int(len(loaded_routes)),
-        "failed_files": failed_files,
-    }
-    return loaded_routes, stats
-
-
-def build_existing_route_3d_index(
-    route_items_wgs: List[Dict[str, Any]],
-    fwd,
-    horizontal_buffer_m: float,
-) -> Dict[str, Any]:
-    routes: List[Dict[str, Any]] = []
-    line_geoms: List[Any] = []
-    corridor_geoms: List[Any] = []
-    hbuf = max(0.0, float(horizontal_buffer_m))
-    for item in route_items_wgs:
-        points_wgs_alt = item.get("points_wgs_alt") or []
-        points_xy: List[Tuple[float, float]] = []
-        alts_m: List[float] = []
-        for lon, lat, alt in points_wgs_alt:
-            try:
-                x, y = wgs_to_xy(fwd, float(lon), float(lat))
-            except Exception:
-                continue
-            pxy = (float(x), float(y))
-            if points_xy and math.hypot(pxy[0] - points_xy[-1][0], pxy[1] - points_xy[-1][1]) <= 0.01:
-                alts_m[-1] = float(alt)
-                continue
-            points_xy.append(pxy)
-            alts_m.append(float(alt))
-        if len(points_xy) < 2:
-            continue
-        try:
-            line_xy = LineString(points_xy)
-        except Exception:
-            continue
-        if line_xy.is_empty or line_xy.length < 1.0:
-            continue
-        cum_dist_m = _polyline_cumulative_dist(points_xy)
-        corridor = line_xy.buffer(hbuf) if hbuf > 0.0 else line_xy.buffer(0.01)
-        route_obj = {
-            "file": str(item.get("file", "")),
-            "name": str(item.get("name", "")),
-            "line_xy": line_xy,
-            "corridor_xy": corridor,
-            "points_xy": points_xy,
-            "alts_msl_m": alts_m,
-            "cum_dist_m": cum_dist_m,
-            "length_m": float(line_xy.length),
-            "min_alt_msl_m": float(min(alts_m)) if alts_m else 0.0,
-            "max_alt_msl_m": float(max(alts_m)) if alts_m else 0.0,
-        }
-        routes.append(route_obj)
-        line_geoms.append(line_xy)
-        corridor_geoms.append(corridor)
-    line_tree = STRtree(line_geoms) if line_geoms else None
-    corridor_tree = STRtree(corridor_geoms) if corridor_geoms else None
-    return {
-        "routes": routes,
-        "line_geoms": line_geoms,
-        "corridor_geoms": corridor_geoms,
-        "line_tree": line_tree,
-        "corridor_tree": corridor_tree,
-        "line_id_map": _build_geom_id_map(line_geoms),
-        "corridor_id_map": _build_geom_id_map(corridor_geoms),
-    }
-
-
-def _existing_route_required_min_msl(
-    point_xy: Tuple[float, float],
-    existing_route_index: Optional[Dict[str, Any]],
-    horizontal_buffer_m: float,
-    vertical_buffer_m: float,
-    relief_union_xy=None,
-) -> Optional[float]:
-    if not existing_route_index:
-        return None
-    routes = existing_route_index.get("routes") or []
-    line_geoms = existing_route_index.get("line_geoms") or []
-    line_tree = existing_route_index.get("line_tree")
-    line_id_map = existing_route_index.get("line_id_map") or {}
-    if not routes or not line_geoms or line_tree is None:
-        return None
-
-    point_geom = Point(point_xy)
-    if relief_union_xy is not None and (not relief_union_xy.is_empty):
-        try:
-            if point_geom.intersects(relief_union_xy):
-                return None
-        except Exception:
-            pass
-    hbuf = max(0.0, float(horizontal_buffer_m))
-    if hbuf <= 0.0:
-        return None
-    query_geom = point_geom.buffer(hbuf + 1.0)
-    route_indices = _tree_candidate_indices(line_tree, query_geom, line_geoms, line_id_map)
-    if not route_indices:
-        return None
-
-    required_min_msl: Optional[float] = None
-    for idx in route_indices:
-        if idx < 0 or idx >= len(routes):
-            continue
-        route = routes[idx]
-        line_xy = route.get("line_xy")
-        if line_xy is None or line_xy.is_empty:
-            continue
-        dist_h = float(point_geom.distance(line_xy))
-        if dist_h > hbuf + 1e-6:
-            continue
-        proj_m = float(line_xy.project(point_geom))
-        alt_ref = _interp_alt_from_cum_dist(route.get("cum_dist_m") or [], route.get("alts_msl_m") or [], proj_m)
-        min_msl_here = float(alt_ref) + max(0.0, float(vertical_buffer_m)) + float(EXISTING_ROUTE_ALT_CLEARANCE_EPS_M)
-        if required_min_msl is None or min_msl_here > required_min_msl:
-            required_min_msl = min_msl_here
-    return required_min_msl
-
-
-def build_existing_route_required_min_profile(
-    samples_xy: List[Tuple[float, float]],
-    existing_route_index: Optional[Dict[str, Any]],
-    horizontal_buffer_m: float,
-    vertical_buffer_m: float,
-    relief_union_xy=None,
-) -> List[Optional[float]]:
-    if not samples_xy:
-        return []
-    out: List[Optional[float]] = []
-    for pxy in samples_xy:
-        out.append(
-            _existing_route_required_min_msl(
-                point_xy=pxy,
-                existing_route_index=existing_route_index,
-                horizontal_buffer_m=horizontal_buffer_m,
-                vertical_buffer_m=vertical_buffer_m,
-                relief_union_xy=relief_union_xy,
-            )
-        )
-    return out
-
-
-def check_existing_route_3d_conflicts(
-    profile_samples: List[Dict[str, float]],
-    fwd,
-    existing_route_index: Optional[Dict[str, Any]],
-    horizontal_buffer_m: float,
-    vertical_buffer_m: float,
-    relief_union_xy=None,
-    max_records: int = 12,
-) -> Dict[str, Any]:
-    empty = {"enabled": False, "sample_count": 0, "conflict_samples": 0, "records": []}
-    if not existing_route_index:
-        return empty
-    routes = existing_route_index.get("routes") or []
-    line_geoms = existing_route_index.get("line_geoms") or []
-    line_tree = existing_route_index.get("line_tree")
-    line_id_map = existing_route_index.get("line_id_map") or {}
-    if not routes or not line_geoms or line_tree is None:
-        return empty
-    hbuf = max(0.0, float(horizontal_buffer_m))
-    vbuf = max(0.0, float(vertical_buffer_m))
-    if hbuf <= 0.0:
-        return {"enabled": True, "sample_count": len(profile_samples), "conflict_samples": 0, "records": []}
-
-    conflict_samples = 0
-    records: List[Dict[str, Any]] = []
-    for sample in profile_samples:
-        lon = sample.get("lon", None)
-        lat = sample.get("lat", None)
-        alt = sample.get("route_alt_msl_m", None)
-        if lon is None or lat is None or alt is None:
-            continue
-        try:
-            x, y = wgs_to_xy(fwd, float(lon), float(lat))
-        except Exception:
-            continue
-        pt = Point(float(x), float(y))
-        if relief_union_xy is not None and (not relief_union_xy.is_empty):
-            try:
-                if pt.intersects(relief_union_xy):
-                    continue
-            except Exception:
-                pass
-        route_indices = _tree_candidate_indices(line_tree, pt.buffer(hbuf + 1.0), line_geoms, line_id_map)
-        if not route_indices:
-            continue
-        local_conflicts: List[Dict[str, Any]] = []
-        for idx in route_indices:
-            if idx < 0 or idx >= len(routes):
-                continue
-            route = routes[idx]
-            line_xy = route.get("line_xy")
-            if line_xy is None or line_xy.is_empty:
-                continue
-            dist_h = float(pt.distance(line_xy))
-            if dist_h > hbuf + 1e-6:
-                continue
-            proj_m = float(line_xy.project(pt))
-            exist_alt = _interp_alt_from_cum_dist(route.get("cum_dist_m") or [], route.get("alts_msl_m") or [], proj_m)
-            delta_alt = abs(float(alt) - float(exist_alt))
-            if delta_alt <= vbuf + 1e-6:
-                local_conflicts.append(
-                    {
-                        "file": str(route.get("file", "")),
-                        "route_name": str(route.get("name", "")),
-                        "distance_m": round(dist_h, 2),
-                        "candidate_alt_msl_m": round(float(alt), 2),
-                        "existing_alt_msl_m": round(float(exist_alt), 2),
-                        "alt_gap_m": round(delta_alt, 2),
-                        "sample_distance_m": round(_safe_float(sample.get("distance_m", 0.0), 0.0), 2),
-                    }
-                )
-        if local_conflicts:
-            conflict_samples += 1
-            if len(records) < max(1, int(max_records)):
-                records.extend(local_conflicts[: max(1, int(max_records)) - len(records)])
-    return {
-        "enabled": True,
-        "sample_count": len(profile_samples),
-        "conflict_samples": int(conflict_samples),
-        "records": records,
-    }
-
-
-def build_existing_route_profile_markers(
-    profile_samples: List[Dict[str, float]],
-    fwd,
-    existing_route_index: Optional[Dict[str, Any]],
-    horizontal_focus_m: float,
-    relief_union_xy=None,
-    search_m: float = EXISTING_ROUTE_PROFILE_MARKER_SEARCH_M,
-    segment_gap_m: float = EXISTING_ROUTE_PROFILE_MARKER_SEG_GAP_M,
-    max_points: int = EXISTING_ROUTE_PROFILE_MARKER_MAX_POINTS,
-) -> List[Dict[str, Any]]:
-    if not existing_route_index:
-        return []
-    routes = existing_route_index.get("routes") or []
-    line_geoms = existing_route_index.get("line_geoms") or []
-    line_tree = existing_route_index.get("line_tree")
-    line_id_map = existing_route_index.get("line_id_map") or {}
-    if not routes or not line_geoms or line_tree is None:
-        return []
-
-    focus_h = max(0.0, float(horizontal_focus_m))
-    search_radius = max(focus_h + 20.0, float(search_m))
-    hits: List[Dict[str, Any]] = []
-    for sample in profile_samples:
-        lon = sample.get("lon", None)
-        lat = sample.get("lat", None)
-        alt_msl = sample.get("route_alt_msl_m", None)
-        if lon is None or lat is None or alt_msl is None:
-            continue
-        try:
-            x, y = wgs_to_xy(fwd, float(lon), float(lat))
-        except Exception:
-            continue
-        pt = Point(float(x), float(y))
-        in_relief = False
-        if relief_union_xy is not None and (not relief_union_xy.is_empty):
-            try:
-                in_relief = bool(pt.intersects(relief_union_xy))
-            except Exception:
-                in_relief = False
-        candidates = _tree_candidate_indices(line_tree, pt.buffer(search_radius), line_geoms, line_id_map)
-        if not candidates:
-            continue
-        best = None
-        best_dist = float("inf")
-        best_abs_delta = float("inf")
-        for idx in candidates:
-            if idx < 0 or idx >= len(routes):
-                continue
-            route = routes[idx]
-            line_xy = route.get("line_xy")
-            if line_xy is None or line_xy.is_empty:
-                continue
-            dist_h = float(pt.distance(line_xy))
-            if dist_h > search_radius + 1e-6:
-                continue
-            proj_m = float(line_xy.project(pt))
-            existing_alt_msl = _interp_alt_from_cum_dist(route.get("cum_dist_m") or [], route.get("alts_msl_m") or [], proj_m)
-            delta_msl = float(alt_msl) - float(existing_alt_msl)
-            abs_delta_msl = abs(delta_msl)
-            if dist_h < best_dist - 1e-6 or (abs(dist_h - best_dist) <= 1e-6 and abs_delta_msl < best_abs_delta):
-                best = {
-                    "distance_m": round(_safe_float(sample.get("distance_m", 0.0), 0.0), 2),
-                    "lon": round(float(lon), 8),
-                    "lat": round(float(lat), 8),
-                    "horizontal_m": round(dist_h, 2),
-                    "candidate_alt_msl_m": round(float(alt_msl), 2),
-                    "existing_alt_msl_m": round(float(existing_alt_msl), 2),
-                    "delta_alt_msl_m": round(delta_msl, 2),
-                    "abs_delta_alt_msl_m": round(abs_delta_msl, 2),
-                    "route_name": str(route.get("name", "")),
-                    "file": str(route.get("file", "")),
-                    "in_relief_zone": bool(in_relief),
-                }
-                best_dist = dist_h
-                best_abs_delta = abs_delta_msl
-        if best is not None and float(best.get("horizontal_m", 1e9)) <= focus_h + 1e-6:
-            hits.append(best)
-
-    if not hits:
-        return []
-
-    hits_sorted = sorted(hits, key=lambda item: float(item.get("distance_m", 0.0)))
-    seg_gap = max(1.0, float(segment_gap_m))
-    selected: List[Dict[str, Any]] = []
-    active: List[Dict[str, Any]] = []
-
-    def _flush(points: List[Dict[str, Any]]) -> None:
-        if not points:
-            return
-        rep = min(
-            points,
-            key=lambda p: (
-                _safe_float(p.get("horizontal_m", 1e9), 1e9),
-                _safe_float(p.get("abs_delta_alt_msl_m", 1e9), 1e9),
-            ),
-        )
-        selected.append(rep)
-
-    for hit in hits_sorted:
-        if active and float(hit.get("distance_m", 0.0)) - float(active[-1].get("distance_m", 0.0)) > seg_gap:
-            _flush(active)
-            active = []
-        active.append(hit)
-    if active:
-        _flush(active)
-
-    selected = sorted(
-        selected,
-        key=lambda item: (
-            _safe_float(item.get("distance_m", 0.0), 0.0),
-            _safe_float(item.get("horizontal_m", 1e9), 1e9),
-        ),
-    )
-    return selected[: max(1, int(max_points))]
-
-
-def _xml_local_name(tag: Any) -> str:
-    if not isinstance(tag, str):
-        return ""
-    if "}" in tag:
-        return tag.rsplit("}", 1)[-1]
-    return tag
-
-
-def _kml_parse_polygon_coords(poly_node: Any) -> List[Tuple[float, float]]:
-    target_node = poly_node
-    for child in list(poly_node):
-        if _xml_local_name(child.tag) == "outerBoundaryIs":
-            target_node = child
-            break
-    coords_text = ""
-    for node in target_node.iter():
-        if _xml_local_name(node.tag) == "coordinates":
-            coords_text = str(node.text or "").strip()
-            if coords_text:
-                break
-    if not coords_text:
-        return []
-    out: List[Tuple[float, float]] = []
-    for token in coords_text.split():
-        parts = token.split(",")
-        if len(parts) < 2:
-            continue
-        try:
-            lon = float(parts[0])
-            lat = float(parts[1])
-        except Exception:
-            continue
-        out.append((lon, lat))
-    if len(out) >= 2 and out[0] == out[-1]:
-        out = out[:-1]
-    return out
-
-
-def load_custom_no_fly_polygons_from_kml(kml_path: Path, fwd) -> Tuple[List[Any], Dict[str, Any]]:
-    raw = kml_path.read_bytes()
-    try:
-        root = ET.fromstring(raw)
-    except Exception as exc:
-        raise ValueError(f"Failed to parse custom no-fly KML: {kml_path}") from exc
-
-    out: List[Any] = []
-    stats: Dict[str, Any] = {
-        "file": str(kml_path),
-        "placemarks": 0,
-        "polygon_nodes": 0,
-        "valid_polygons": 0,
-        "invalid_polygons": 0,
-    }
-    placemark_nodes = [node for node in root.iter() if _xml_local_name(node.tag) == "Placemark"]
-    stats["placemarks"] = len(placemark_nodes)
-    for placemark in placemark_nodes:
-        polygon_nodes = [node for node in placemark.iter() if _xml_local_name(node.tag) == "Polygon"]
-        for poly_node in polygon_nodes:
-            stats["polygon_nodes"] = int(stats["polygon_nodes"]) + 1
-            coords = _kml_parse_polygon_coords(poly_node)
-            if len(coords) < 3:
-                stats["invalid_polygons"] = int(stats["invalid_polygons"]) + 1
-                continue
-            try:
-                geom = Polygon(coords)
-            except Exception:
-                stats["invalid_polygons"] = int(stats["invalid_polygons"]) + 1
-                continue
-            if not geom.is_valid:
-                try:
-                    geom = geom.buffer(0)
-                except Exception:
-                    geom = Polygon()
-            if geom.is_empty:
-                stats["invalid_polygons"] = int(stats["invalid_polygons"]) + 1
-                continue
-            geoms = [geom] if geom.geom_type == "Polygon" else list(geom.geoms) if geom.geom_type == "MultiPolygon" else []
-            if not geoms:
-                stats["invalid_polygons"] = int(stats["invalid_polygons"]) + 1
-                continue
-            added = 0
-            for item in geoms:
-                try:
-                    item_xy = transform(fwd, item)
-                except Exception:
-                    continue
-                if item_xy.is_empty:
-                    continue
-                if item_xy.geom_type == "Polygon":
-                    out.append(item_xy)
-                    added += 1
-                elif item_xy.geom_type == "MultiPolygon":
-                    for part in item_xy.geoms:
-                        if part is None or part.is_empty:
-                            continue
-                        out.append(part)
-                        added += 1
-            if added > 0:
-                stats["valid_polygons"] = int(stats["valid_polygons"]) + added
-            else:
-                stats["invalid_polygons"] = int(stats["invalid_polygons"]) + 1
-    return out, stats
 
 
 def _summary_complete(summary: Dict[str, Any]) -> bool:
@@ -2002,7 +1447,6 @@ out geom tags;
             "soft": 0,
             "civil_source": "xls_dataset",
             "civil_dataset": civil_stats,
-            "overpass_query_ok": False,
         }, civil_hard_polygons_xy, [], []
     soft_polygons_xy: List[Any] = []
     military_hard_polygons_xy: List[Any] = []
@@ -2014,7 +1458,6 @@ out geom tags;
         "soft": 0,
         "civil_source": "xls_dataset",
         "civil_dataset": civil_stats,
-        "overpass_query_ok": True,
     }
     max_zone_area_m2 = 180_000_000.0
     max_span_m = 80_000.0
@@ -2062,7 +1505,7 @@ out geom tags;
 def fetch_school_kindergarten_zones(
     bbox_wgs: Tuple[float, float, float, float],
     fwd,
-) -> Tuple[List[Any], List[Any], Dict[str, Any], List[Dict[str, Any]]]:
+) -> Tuple[List[Any], List[Any], Dict[str, int], List[Dict[str, Any]]]:
     south, north, west, east = bbox_wgs
     query = f"""
 [out:json][timeout:120];
@@ -2074,11 +1517,11 @@ out geom tags;
     try:
         data = run_overpass(query, timeout=120)
     except Exception:
-        return [], [], {"school": 0, "kindergarten": 0, "overpass_query_ok": False}, []
+        return [], [], {"school": 0, "kindergarten": 0}, []
     hard_zones_xy: List[Any] = []
     points_xy: List[Any] = []
     school_poi_items: List[Dict[str, Any]] = []
-    counter: Dict[str, Any] = {"school": 0, "kindergarten": 0, "overpass_query_ok": True}
+    counter = {"school": 0, "kindergarten": 0}
     for el in data.get("elements", []):
         tags = el.get("tags") or {}
         amenity = str(tags.get("amenity", "")).strip().lower()
@@ -2120,7 +1563,7 @@ out geom tags;
 def fetch_osm_buildings_and_obstacles(
     bbox_wgs: Tuple[float, float, float, float],
     fwd,
-) -> Tuple[List[Any], List[float], List[Any], List[float], Dict[str, Any]]:
+) -> Tuple[List[Any], List[float], List[Any], List[float], Dict[str, int]]:
     south, north, west, east = bbox_wgs
     query = f"""
 [out:json][timeout:150];
@@ -2135,7 +1578,7 @@ out geom tags;
     try:
         data = run_overpass(query, timeout=150)
     except Exception:
-        return [], [], [], [], {"building": 0, "obstacle": 0, "overpass_query_ok": False}
+        return [], [], [], [], {"building": 0, "obstacle": 0}
     b_geoms: List[Any] = []
     b_heights: List[float] = []
     o_geoms: List[Any] = []
@@ -2203,7 +1646,7 @@ out geom tags;
         o_geoms.append(g2)
         o_heights.append(oh)
         c_obstacle += 1
-    return b_geoms, b_heights, o_geoms, o_heights, {"building": c_building, "obstacle": c_obstacle, "overpass_query_ok": True}
+    return b_geoms, b_heights, o_geoms, o_heights, {"building": c_building, "obstacle": c_obstacle}
 
 
 def _is_usable_road_class(highway: str) -> bool:
@@ -2409,125 +1852,6 @@ def load_low_risk_landuse_polygons(summary: Dict[str, Any], fwd) -> Tuple[List[A
         if g_xy.geom_type in {"Polygon", "MultiPolygon"}:
             out.append(g_xy)
     return out, counter
-
-
-def _emergency_landing_zone_type(token: str) -> Tuple[bool, str, float]:
-    t = str(token or "").strip().lower()
-    if not t:
-        return False, "", 0.0
-    if t.startswith("leisure:park") or t.startswith("leisure:garden"):
-        return True, "公园绿地", 0.08
-    if t.startswith("landuse:grass") or t.startswith("natural:grassland"):
-        return True, "草坪草地", 0.12
-    if t.startswith("landuse:meadow"):
-        return True, "草甸空地", 0.18
-    if t.startswith("landuse:greenfield") or t.startswith("landuse:brownfield"):
-        return True, "待开发空地", 0.22
-    if t.startswith("landuse:farmland"):
-        return True, "农田开阔地", 0.32
-    if t.startswith("landuse:recreation_ground"):
-        return True, "活动空地", 0.2
-    return False, "", 0.0
-
-
-def load_emergency_landing_polygons(
-    summary: Dict[str, Any],
-    fwd,
-) -> Tuple[List[Any], List[str], List[float], Dict[str, int]]:
-    outputs = summary.get("outputs", {})
-    landuse_geojson = Path(outputs.get("landuse", {}).get("geojson", ""))
-    geoms: List[Any] = []
-    labels: List[str] = []
-    base_risks: List[float] = []
-    counter = {
-        "公园绿地": 0,
-        "草坪草地": 0,
-        "草甸空地": 0,
-        "待开发空地": 0,
-        "农田开阔地": 0,
-        "活动空地": 0,
-    }
-    for feat in load_geojson_features(landuse_geojson):
-        props = feat.get("properties") or {}
-        token = str(props.get("landuse_type", "")).strip().lower()
-        ok, label, base_risk = _emergency_landing_zone_type(token)
-        if not ok:
-            continue
-        try:
-            g = shape(feat.get("geometry") or {})
-        except Exception:
-            continue
-        g_xy = _to_xy_geometry(g, fwd)
-        if g_xy is None:
-            continue
-        if g_xy.geom_type not in {"Polygon", "MultiPolygon"}:
-            continue
-        geoms.append(g_xy)
-        labels.append(label)
-        base_risks.append(float(base_risk))
-        counter[label] = int(counter.get(label, 0) + 1)
-    return geoms, labels, base_risks, counter
-
-
-def _mainline_tangent_vector(
-    route_line_xy: LineString,
-    distance_m: float,
-    delta_m: float = 45.0,
-) -> Optional[Tuple[float, float]]:
-    if route_line_xy is None or route_line_xy.is_empty:
-        return None
-    total_len = max(0.0, float(route_line_xy.length))
-    d = max(0.0, min(total_len, float(distance_m)))
-    d_prev = max(0.0, d - max(5.0, float(delta_m)))
-    d_next = min(total_len, d + max(5.0, float(delta_m)))
-    try:
-        p_prev = route_line_xy.interpolate(d_prev)
-        p_cur = route_line_xy.interpolate(d)
-        p_next = route_line_xy.interpolate(d_next)
-    except Exception:
-        return None
-    vec = (float(p_cur.x - p_prev.x), float(p_cur.y - p_prev.y))
-    if math.hypot(vec[0], vec[1]) < 1e-6:
-        vec = (float(p_next.x - p_cur.x), float(p_next.y - p_cur.y))
-    if math.hypot(vec[0], vec[1]) < 1e-6:
-        return None
-    return vec
-
-
-def _build_emergency_anchor_distances(
-    seg_start_m: float,
-    seg_end_m: float,
-    route_len_m: float,
-    step_m: float = EMERGENCY_ROUTE_ANCHOR_STEP_M,
-) -> List[float]:
-    start_m = max(0.0, float(seg_start_m))
-    end_m = max(start_m, float(seg_end_m))
-    total_len = max(0.0, float(route_len_m))
-    if total_len <= 0.0 or end_m <= start_m:
-        return []
-    center = 0.5 * (start_m + end_m)
-    seq: List[float] = [center]
-    max_shift = max(0.0, 0.5 * (end_m - start_m))
-    offset = float(step_m)
-    while offset <= max_shift + 1e-6:
-        seq.append(center - offset)
-        seq.append(center + offset)
-        offset += float(step_m)
-    seq.append(start_m + 0.2 * (end_m - start_m))
-    seq.append(start_m + 0.8 * (end_m - start_m))
-    out: List[float] = []
-    seen = set()
-    min_margin = 25.0
-    if total_len <= 2.0 * min_margin:
-        min_margin = 0.0
-    for d in seq:
-        clamped = max(min_margin, min(total_len - min_margin, float(d)))
-        key = round(clamped, 1)
-        if key in seen:
-            continue
-        seen.add(key)
-        out.append(clamped)
-    return out
 
 
 def build_infrastructure_index(
@@ -3593,67 +2917,6 @@ def polyline_min_interior_angle(points: List[Tuple[float, float]]) -> float:
     return max(0.0, min(180.0, best))
 
 
-def _segment_heading_deg(a: Tuple[float, float], b: Tuple[float, float]) -> float:
-    dx = float(b[0] - a[0])
-    dy = float(b[1] - a[1])
-    if abs(dx) < 1e-9 and abs(dy) < 1e-9:
-        return 0.0
-    return (math.degrees(math.atan2(dy, dx)) + 360.0) % 180.0
-
-
-def _heading_gap_deg(a_deg: float, b_deg: float) -> float:
-    diff = abs(float(a_deg) - float(b_deg)) % 180.0
-    return min(diff, 180.0 - diff)
-
-
-def _slide_point(start: Tuple[float, float], end: Tuple[float, float], dist_m: float) -> Tuple[float, float]:
-    seg_len = math.hypot(end[0] - start[0], end[1] - start[1])
-    if seg_len <= 1e-9:
-        return (float(end[0]), float(end[1]))
-    ratio = _clip01(dist_m / seg_len)
-    return (
-        float(start[0] + (end[0] - start[0]) * ratio),
-        float(start[1] + (end[1] - start[1]) * ratio),
-    )
-
-
-def _is_polyline_candidate_safe(
-    candidate_points: List[Tuple[float, float]],
-    original_points: List[Tuple[float, float]],
-    pop_sampler: PopulationSampler,
-    inv,
-    nofly_hard,
-    infra_hard,
-    crowd_hard,
-    max_len_ratio: float = 1.04,
-    p90_ratio: float = 1.06,
-    p90_add: float = 36.0,
-    avg_ratio: float = 1.08,
-    avg_add: float = 36.0,
-) -> bool:
-    if len(candidate_points) < 2 or len(original_points) < 2:
-        return False
-    candidate = LineString(candidate_points)
-    original = LineString(original_points)
-    if candidate.length <= 0.0 or original.length <= 0.0:
-        return False
-    if candidate.length > original.length * max(1.0, max_len_ratio):
-        return False
-    if nofly_hard is not None and candidate.intersects(nofly_hard):
-        return False
-    if infra_hard is not None and candidate.intersects(infra_hard):
-        return False
-    if crowd_hard is not None and candidate.intersects(crowd_hard):
-        return False
-    c_avg, c_p90, _ = _line_population_stats(candidate, pop_sampler, inv)
-    o_avg, o_p90, _ = _line_population_stats(original, pop_sampler, inv)
-    if c_p90 > o_p90 * p90_ratio + p90_add:
-        return False
-    if c_avg > o_avg * avg_ratio + avg_add:
-        return False
-    return True
-
-
 def _is_shortcut_safe(
     direct: LineString,
     original: LineString,
@@ -3864,233 +3127,6 @@ def enforce_min_turn_angle(
     return pts
 
 
-def regularize_parallel_bridge_segments(
-    points: List[Tuple[float, float]],
-    min_turn_angle_deg: float,
-    pop_sampler: PopulationSampler,
-    inv,
-    no_fly_hard_union_xy,
-    infra_hard_union_xy,
-    crowd_hard_union_xy=None,
-    passes: int = 2,
-) -> List[Tuple[float, float]]:
-    if len(points) < 4:
-        return points
-    pts = points[:]
-    nofly_hard = no_fly_hard_union_xy if no_fly_hard_union_xy is not None and (not no_fly_hard_union_xy.is_empty) else None
-    infra_hard = infra_hard_union_xy if infra_hard_union_xy is not None and (not infra_hard_union_xy.is_empty) else None
-    crowd_hard = crowd_hard_union_xy if crowd_hard_union_xy is not None and (not crowd_hard_union_xy.is_empty) else None
-    for _ in range(max(1, passes)):
-        changed = False
-        out: List[Tuple[float, float]] = [pts[0]]
-        i = 1
-        while i < len(pts) - 2:
-            a = out[-1]
-            b = pts[i]
-            c = pts[i + 1]
-            d = pts[i + 2]
-            len_ab = math.hypot(b[0] - a[0], b[1] - a[1])
-            len_bc = math.hypot(c[0] - b[0], c[1] - b[1])
-            len_cd = math.hypot(d[0] - c[0], d[1] - c[1])
-            if (
-                len_ab < HUMANIZE_MIN_ANCHOR_M
-                or len_cd < HUMANIZE_MIN_ANCHOR_M
-                or len_bc < 120.0
-                or len_bc > HUMANIZE_MAX_BRIDGE_M
-            ):
-                out.append(b)
-                i += 1
-                continue
-            heading_ab = _segment_heading_deg(a, b)
-            heading_bc = _segment_heading_deg(b, c)
-            heading_cd = _segment_heading_deg(c, d)
-            gap_parallel = _heading_gap_deg(heading_ab, heading_cd)
-            gap_bridge = min(_heading_gap_deg(heading_ab, heading_bc), _heading_gap_deg(heading_cd, heading_bc))
-            if gap_parallel > HUMANIZE_PARALLEL_HEADING_GAP_DEG:
-                out.append(b)
-                i += 1
-                continue
-            if not (HUMANIZE_BRIDGE_MIN_DEFLECTION_DEG <= gap_bridge <= HUMANIZE_BRIDGE_MAX_DEFLECTION_DEG):
-                out.append(b)
-                i += 1
-                continue
-            best_pair: Optional[Tuple[Tuple[float, float], Tuple[float, float], float]] = None
-            original_local = [a, b, c, d]
-            for left_fraction in HUMANIZE_SLIDE_FRACTIONS:
-                slide_ab = len_ab * float(left_fraction)
-                if len_ab - slide_ab < HUMANIZE_MIN_RESIDUAL_M:
-                    continue
-                b_new = _slide_point(a, b, len_ab - slide_ab)
-                for right_fraction in HUMANIZE_SLIDE_FRACTIONS:
-                    slide_cd = len_cd * float(right_fraction)
-                    if len_cd - slide_cd < HUMANIZE_MIN_RESIDUAL_M:
-                        continue
-                    c_new = _slide_point(c, d, slide_cd)
-                    if math.hypot(c_new[0] - b_new[0], c_new[1] - b_new[1]) <= len_bc + 80.0:
-                        continue
-                    candidate_local = [a, b_new, c_new, d]
-                    if polyline_min_interior_angle(candidate_local) < (float(min_turn_angle_deg) - 1e-6):
-                        continue
-                    if not _is_polyline_candidate_safe(
-                        candidate_points=candidate_local,
-                        original_points=original_local,
-                        pop_sampler=pop_sampler,
-                        inv=inv,
-                        nofly_hard=nofly_hard,
-                        infra_hard=infra_hard,
-                        crowd_hard=crowd_hard,
-                        max_len_ratio=1.03,
-                        p90_ratio=1.05,
-                        p90_add=32.0,
-                        avg_ratio=1.06,
-                        avg_add=32.0,
-                    ):
-                        continue
-                    bridge_len = math.hypot(c_new[0] - b_new[0], c_new[1] - b_new[1])
-                    score = bridge_len - 0.15 * (LineString(candidate_local).length - LineString(original_local).length)
-                    if best_pair is None or score > best_pair[2]:
-                        best_pair = (b_new, c_new, score)
-            if best_pair is None:
-                out.append(b)
-                i += 1
-                continue
-            out.append(best_pair[0])
-            out.append(best_pair[1])
-            changed = True
-            i += 2
-        while i < len(pts) - 1:
-            out.append(pts[i])
-            i += 1
-        out.append(pts[-1])
-        pts = out
-        if not changed or len(pts) < 4:
-            break
-    return pts
-
-
-def regularize_short_residual_segments(
-    points: List[Tuple[float, float]],
-    min_turn_angle_deg: float,
-    pop_sampler: PopulationSampler,
-    inv,
-    no_fly_hard_union_xy,
-    infra_hard_union_xy,
-    crowd_hard_union_xy=None,
-    passes: int = 3,
-) -> List[Tuple[float, float]]:
-    if len(points) < 4:
-        return points
-    pts = points[:]
-    nofly_hard = no_fly_hard_union_xy if no_fly_hard_union_xy is not None and (not no_fly_hard_union_xy.is_empty) else None
-    infra_hard = infra_hard_union_xy if infra_hard_union_xy is not None and (not infra_hard_union_xy.is_empty) else None
-    crowd_hard = crowd_hard_union_xy if crowd_hard_union_xy is not None and (not crowd_hard_union_xy.is_empty) else None
-    for _ in range(max(1, passes)):
-        changed = False
-        out: List[Tuple[float, float]] = [pts[0]]
-        for i in range(1, len(pts) - 1):
-            prev = out[-1]
-            cur = pts[i]
-            nxt = pts[i + 1]
-            len_prev = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
-            len_next = math.hypot(nxt[0] - cur[0], nxt[1] - cur[1])
-            if min(len_prev, len_next) > HUMANIZE_SHORT_SEGMENT_MAX_M:
-                out.append(cur)
-                continue
-            heading_prev = _segment_heading_deg(prev, cur)
-            heading_next = _segment_heading_deg(cur, nxt)
-            if _heading_gap_deg(heading_prev, heading_next) > HUMANIZE_SHORT_SEGMENT_HEADING_GAP_DEG:
-                out.append(cur)
-                continue
-            local_original = [prev, cur, nxt]
-            if not _is_polyline_candidate_safe(
-                candidate_points=[prev, nxt],
-                original_points=local_original,
-                pop_sampler=pop_sampler,
-                inv=inv,
-                nofly_hard=nofly_hard,
-                infra_hard=infra_hard,
-                crowd_hard=crowd_hard,
-                max_len_ratio=1.02,
-                p90_ratio=1.06,
-                p90_add=30.0,
-                avg_ratio=1.08,
-                avg_add=30.0,
-            ):
-                out.append(cur)
-                continue
-            local_window: List[Tuple[float, float]] = []
-            if len(out) >= 2:
-                local_window.append(out[-2])
-            local_window.extend([prev, nxt])
-            if i + 2 < len(pts):
-                local_window.append(pts[i + 2])
-            if len(local_window) >= 3 and polyline_min_interior_angle(local_window) < (float(min_turn_angle_deg) - 1e-6):
-                out.append(cur)
-                continue
-            changed = True
-        out.append(pts[-1])
-        pts = out
-        if not changed or len(pts) < 4:
-            break
-    return pts
-
-
-def compress_collinear_short_runs(
-    points: List[Tuple[float, float]],
-    pop_sampler: PopulationSampler,
-    inv,
-    no_fly_hard_union_xy,
-    infra_hard_union_xy,
-    crowd_hard_union_xy=None,
-    passes: int = 3,
-) -> List[Tuple[float, float]]:
-    if len(points) < 4:
-        return points
-    pts = points[:]
-    nofly_hard = no_fly_hard_union_xy if no_fly_hard_union_xy is not None and (not no_fly_hard_union_xy.is_empty) else None
-    infra_hard = infra_hard_union_xy if infra_hard_union_xy is not None and (not infra_hard_union_xy.is_empty) else None
-    crowd_hard = crowd_hard_union_xy if crowd_hard_union_xy is not None and (not crowd_hard_union_xy.is_empty) else None
-    for _ in range(max(1, passes)):
-        changed = False
-        out: List[Tuple[float, float]] = [pts[0]]
-        for i in range(1, len(pts) - 1):
-            prev = out[-1]
-            cur = pts[i]
-            nxt = pts[i + 1]
-            len_prev = math.hypot(cur[0] - prev[0], cur[1] - prev[1])
-            len_next = math.hypot(nxt[0] - cur[0], nxt[1] - cur[1])
-            if max(len_prev, len_next) > HUMANIZE_COLLINEAR_SHORT_MAX_M:
-                out.append(cur)
-                continue
-            heading_prev = _segment_heading_deg(prev, cur)
-            heading_next = _segment_heading_deg(cur, nxt)
-            if _heading_gap_deg(heading_prev, heading_next) > HUMANIZE_COLLINEAR_HEADING_GAP_DEG:
-                out.append(cur)
-                continue
-            if not _is_polyline_candidate_safe(
-                candidate_points=[prev, nxt],
-                original_points=[prev, cur, nxt],
-                pop_sampler=pop_sampler,
-                inv=inv,
-                nofly_hard=nofly_hard,
-                infra_hard=infra_hard,
-                crowd_hard=crowd_hard,
-                max_len_ratio=1.01,
-                p90_ratio=1.04,
-                p90_add=24.0,
-                avg_ratio=1.05,
-                avg_add=24.0,
-            ):
-                out.append(cur)
-                continue
-            changed = True
-        out.append(pts[-1])
-        pts = out
-        if not changed or len(pts) < 4:
-            break
-    return pts
-
-
 def enforce_waypoint_budget(
     points: List[Tuple[float, float]],
     max_waypoints: int,
@@ -4212,568 +3248,6 @@ def _can_link_profile_samples(
     return True
 
 
-def _can_assign_constant_profile_level(
-    start_idx: int,
-    end_idx: int,
-    level_msl: float,
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-) -> bool:
-    if start_idx < 0 or end_idx < start_idx:
-        return False
-    level = float(level_msl)
-    for idx in range(start_idx, end_idx + 1):
-        if level + 1e-6 < z_min[idx] or level > z_hard_cap[idx] + 1e-6:
-            return False
-    if start_idx > 0:
-        ds = max(1e-6, float(cum_dist_m[start_idx] - cum_dist_m[start_idx - 1]))
-        dz = level - float(z[start_idx - 1])
-        if dz > climb_ratio * ds + 1e-6:
-            return False
-        if -dz > descend_ratio * ds + 1e-6:
-            return False
-    if end_idx < len(z) - 1:
-        ds = max(1e-6, float(cum_dist_m[end_idx + 1] - cum_dist_m[end_idx]))
-        dz = float(z[end_idx + 1]) - level
-        if dz > climb_ratio * ds + 1e-6:
-            return False
-        if -dz > descend_ratio * ds + 1e-6:
-            return False
-    return True
-
-
-def _can_assign_linear_profile(
-    start_idx: int,
-    end_idx: int,
-    start_level_msl: float,
-    end_level_msl: float,
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-) -> bool:
-    if start_idx < 0 or end_idx <= start_idx:
-        return False
-    ds_total = max(1e-6, float(cum_dist_m[end_idx] - cum_dist_m[start_idx]))
-    dz_total = float(end_level_msl) - float(start_level_msl)
-    if dz_total > climb_ratio * ds_total + 1e-6:
-        return False
-    if -dz_total > descend_ratio * ds_total + 1e-6:
-        return False
-    for idx in range(start_idx, end_idx + 1):
-        ratio = (float(cum_dist_m[idx]) - float(cum_dist_m[start_idx])) / ds_total
-        zi = float(start_level_msl) + dz_total * ratio
-        if zi + 1e-6 < z_min[idx] or zi > z_hard_cap[idx] + 1e-6:
-            return False
-    return True
-
-
-def regularize_altitude_plateaus(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    passes: int = 4,
-) -> List[float]:
-    if len(z) < 5:
-        return z
-    out = [float(v) for v in z]
-    for _ in range(max(1, passes)):
-        changed = False
-        run_start = 1
-        while run_start < len(out) - 1:
-            run_end = run_start
-            while (
-                run_end + 1 < len(out) - 1
-                and abs(float(out[run_end + 1]) - float(out[run_start])) <= ALT_PLATEAU_LEVEL_TOL_M
-            ):
-                run_end += 1
-            run_len_m = float(cum_dist_m[run_end] - cum_dist_m[run_start])
-            cur_level = float(out[run_start])
-            prev_level = float(out[run_start - 1])
-            next_level = float(out[run_end + 1])
-            prev_gap = abs(cur_level - prev_level)
-            next_gap = abs(next_level - cur_level)
-            candidates: List[float] = []
-            if prev_gap <= ALT_PLATEAU_SMALL_STEP_M + 1e-6:
-                candidates.append(prev_level)
-            if next_gap <= ALT_PLATEAU_SMALL_STEP_M + 1e-6 and all(abs(next_level - c) > 1e-6 for c in candidates):
-                candidates.append(next_level)
-            if run_len_m <= ALT_PLATEAU_MIN_LEN_M + 1e-6 and candidates:
-                feasible: List[float] = []
-                for candidate_level in sorted(candidates):
-                    if _can_assign_constant_profile_level(
-                        run_start,
-                        run_end,
-                        candidate_level,
-                        z=out,
-                        z_min=z_min,
-                        z_hard_cap=z_hard_cap,
-                        cum_dist_m=cum_dist_m,
-                        climb_ratio=climb_ratio,
-                        descend_ratio=descend_ratio,
-                    ):
-                        feasible.append(candidate_level)
-                if feasible:
-                    chosen = feasible[0]
-                    for idx in range(run_start, run_end + 1):
-                        out[idx] = float(chosen)
-                    changed = True
-            run_start = run_end + 1
-        if not changed:
-            break
-    return out
-
-
-def smooth_terminal_descent_profile(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-) -> List[float]:
-    if len(z) < 5:
-        return z
-    out = [float(v) for v in z]
-    end_idx = len(out) - 1
-    end_level = float(out[end_idx])
-    tail_start = end_idx - 1
-    for idx in range(end_idx - 1, 0, -1):
-        span = max(out[idx:end_idx + 1]) - min(out[idx:end_idx + 1])
-        if span > ALT_TERMINAL_DESCENT_MAX_SPAN_M + 1e-6:
-            break
-        monotone_ok = True
-        for k in range(idx, end_idx):
-            if out[k + 1] > out[k] + ALT_PLATEAU_LEVEL_TOL_M:
-                monotone_ok = False
-                break
-        if not monotone_ok:
-            break
-        tail_start = idx
-    tail_len_m = float(cum_dist_m[end_idx] - cum_dist_m[tail_start])
-    if tail_len_m < ALT_TERMINAL_DESCENT_MIN_LEN_M:
-        return out
-    start_level = float(out[tail_start])
-    if start_level - end_level <= ALT_PLATEAU_LEVEL_TOL_M:
-        return out
-    if not _can_assign_linear_profile(
-        tail_start,
-        end_idx,
-        start_level,
-        end_level,
-        z_min=z_min,
-        z_hard_cap=z_hard_cap,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-    ):
-        return out
-    ds_total = max(1e-6, float(cum_dist_m[end_idx] - cum_dist_m[tail_start]))
-    dz_total = end_level - start_level
-    for idx in range(tail_start, end_idx + 1):
-        ratio = (float(cum_dist_m[idx]) - float(cum_dist_m[tail_start])) / ds_total
-        out[idx] = start_level + dz_total * ratio
-    return out
-
-
-def snap_near_integer_altitude_plateaus(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    passes: int = 2,
-) -> List[float]:
-    if len(z) < 3:
-        return z
-    out = [float(v) for v in z]
-    for _ in range(max(1, passes)):
-        changed = False
-        start = 1
-        while start < len(out) - 1:
-            end = start
-            while end + 1 < len(out) - 1 and abs(out[end + 1] - out[start]) <= ALT_PLATEAU_LEVEL_TOL_M:
-                end += 1
-            level = float(out[start])
-            snapped = round(level)
-            if abs(snapped - level) <= ALT_INTEGER_PLATEAU_SNAP_TOL_M and abs(snapped - level) > 1e-6:
-                if _can_assign_constant_profile_level(
-                    start,
-                    end,
-                    float(snapped),
-                    z=out,
-                    z_min=z_min,
-                    z_hard_cap=z_hard_cap,
-                    cum_dist_m=cum_dist_m,
-                    climb_ratio=climb_ratio,
-                    descend_ratio=descend_ratio,
-                ):
-                    for idx in range(start, end + 1):
-                        out[idx] = float(snapped)
-                    changed = True
-            start = end + 1
-        if not changed:
-            break
-    return out
-
-
-def smooth_descending_bridge_plateaus(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    passes: int = 2,
-) -> List[float]:
-    if len(z) < 6:
-        return z
-    out = [float(v) for v in z]
-    for _ in range(max(1, passes)):
-        changed = False
-        runs: List[Tuple[int, int, float]] = []
-        start = 1
-        while start < len(out) - 1:
-            end = start
-            while end + 1 < len(out) - 1 and abs(out[end + 1] - out[start]) <= ALT_PLATEAU_LEVEL_TOL_M:
-                end += 1
-            runs.append((start, end, float(out[start])))
-            start = end + 1
-        for idx in range(1, len(runs) - 1):
-            cur_start, cur_end, cur_level = runs[idx]
-            prev_start, prev_end, prev_level = runs[idx - 1]
-            next_start, next_end, next_level = runs[idx + 1]
-            if not (prev_level > cur_level > next_level):
-                continue
-            if min(prev_level - cur_level, cur_level - next_level) > ALT_DESCENDING_BRIDGE_STEP_M + 1e-6:
-                continue
-            run_len_m = float(cum_dist_m[cur_end] - cum_dist_m[cur_start])
-            if run_len_m > ALT_DESCENDING_BRIDGE_MAX_LEN_M:
-                continue
-            if not _can_assign_linear_profile(
-                prev_end,
-                next_start,
-                prev_level,
-                next_level,
-                z_min=z_min,
-                z_hard_cap=z_hard_cap,
-                cum_dist_m=cum_dist_m,
-                climb_ratio=climb_ratio,
-                descend_ratio=descend_ratio,
-            ):
-                continue
-            ds_total = max(1e-6, float(cum_dist_m[next_start] - cum_dist_m[prev_end]))
-            dz_total = float(next_level - prev_level)
-            for sample_idx in range(prev_end, next_start + 1):
-                ratio = (float(cum_dist_m[sample_idx]) - float(cum_dist_m[prev_end])) / ds_total
-                out[sample_idx] = prev_level + dz_total * ratio
-            changed = True
-            break
-        if not changed:
-            break
-    return out
-
-
-def smooth_ascending_bridge_plateaus(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    passes: int = 2,
-) -> List[float]:
-    if len(z) < 6:
-        return z
-    out = [float(v) for v in z]
-    for _ in range(max(1, passes)):
-        changed = False
-        runs: List[Tuple[int, int, float]] = []
-        start = 1
-        while start < len(out) - 1:
-            end = start
-            while end + 1 < len(out) - 1 and abs(out[end + 1] - out[start]) <= ALT_PLATEAU_LEVEL_TOL_M:
-                end += 1
-            runs.append((start, end, float(out[start])))
-            start = end + 1
-        for idx in range(1, len(runs) - 1):
-            cur_start, cur_end, cur_level = runs[idx]
-            _, prev_end, prev_level = runs[idx - 1]
-            next_start, _, next_level = runs[idx + 1]
-            if not (prev_level < cur_level < next_level):
-                continue
-            if min(cur_level - prev_level, next_level - cur_level) > ALT_ASCENDING_BRIDGE_STEP_M + 1e-6:
-                continue
-            run_len_m = float(cum_dist_m[cur_end] - cum_dist_m[cur_start])
-            if run_len_m > ALT_ASCENDING_BRIDGE_MAX_LEN_M:
-                continue
-            if not _can_assign_linear_profile(
-                prev_end,
-                next_start,
-                prev_level,
-                next_level,
-                z_min=z_min,
-                z_hard_cap=z_hard_cap,
-                cum_dist_m=cum_dist_m,
-                climb_ratio=climb_ratio,
-                descend_ratio=descend_ratio,
-            ):
-                continue
-            ds_total = max(1e-6, float(cum_dist_m[next_start] - cum_dist_m[prev_end]))
-            dz_total = float(next_level - prev_level)
-            for sample_idx in range(prev_end, next_start + 1):
-                ratio = (float(cum_dist_m[sample_idx]) - float(cum_dist_m[prev_end])) / ds_total
-                out[sample_idx] = prev_level + dz_total * ratio
-            changed = True
-            break
-        if not changed:
-            break
-    return out
-
-
-def smooth_ascending_plateau_starts(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    passes: int = 2,
-) -> List[float]:
-    if len(z) < 5:
-        return z
-    out = [float(v) for v in z]
-    for _ in range(max(1, passes)):
-        changed = False
-        runs: List[Tuple[int, int, float]] = []
-        start = 1
-        while start < len(out) - 1:
-            end = start
-            while end + 1 < len(out) - 1 and abs(out[end + 1] - out[start]) <= ALT_PLATEAU_LEVEL_TOL_M:
-                end += 1
-            runs.append((start, end, float(out[start])))
-            start = end + 1
-        for idx in range(len(runs) - 1):
-            cur_start, cur_end, cur_level = runs[idx]
-            next_start, _, next_level = runs[idx + 1]
-            if not (cur_level < next_level):
-                continue
-            if next_level - cur_level > ALT_ASCENDING_PLATEAU_START_MAX_STEP_M + 1e-6:
-                continue
-            run_len_m = float(cum_dist_m[cur_end] - cum_dist_m[cur_start])
-            if run_len_m < ALT_ASCENDING_PLATEAU_START_MIN_LEN_M:
-                continue
-            if not _can_assign_linear_profile(
-                cur_start,
-                next_start,
-                cur_level,
-                next_level,
-                z_min=z_min,
-                z_hard_cap=z_hard_cap,
-                cum_dist_m=cum_dist_m,
-                climb_ratio=climb_ratio,
-                descend_ratio=descend_ratio,
-            ):
-                continue
-            ds_total = max(1e-6, float(cum_dist_m[next_start] - cum_dist_m[cur_start]))
-            dz_total = float(next_level - cur_level)
-            for sample_idx in range(cur_start, next_start + 1):
-                ratio = (float(cum_dist_m[sample_idx]) - float(cum_dist_m[cur_start])) / ds_total
-                out[sample_idx] = cur_level + dz_total * ratio
-            changed = True
-            break
-        if not changed:
-            break
-    return out
-
-
-def flatten_small_altitude_staircases(
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    passes: int = 3,
-) -> List[float]:
-    if len(z) < 5:
-        return z
-    out = [float(v) for v in z]
-    for _ in range(max(1, passes)):
-        changed = False
-        runs: List[Tuple[int, int, float]] = []
-        start = 1
-        while start < len(out) - 1:
-            end = start
-            while end + 1 < len(out) - 1 and abs(float(out[end + 1]) - float(out[start])) <= ALT_PLATEAU_LEVEL_TOL_M:
-                end += 1
-            runs.append((start, end, float(out[start])))
-            start = end + 1
-        if len(runs) < 2:
-            break
-        run_idx = 0
-        while run_idx < len(runs):
-            start_run = run_idx
-            min_level = runs[run_idx][2]
-            max_level = runs[run_idx][2]
-            direction = 0
-            end_run = start_run
-            while end_run + 1 < len(runs):
-                next_level = runs[end_run + 1][2]
-                prev_level = runs[end_run][2]
-                delta = next_level - prev_level
-                if abs(delta) <= ALT_PLATEAU_LEVEL_TOL_M:
-                    end_run += 1
-                    min_level = min(min_level, next_level)
-                    max_level = max(max_level, next_level)
-                    continue
-                step_dir = 1 if delta > 0 else -1
-                if direction == 0:
-                    direction = step_dir
-                elif step_dir != direction:
-                    break
-                candidate_min = min(min_level, next_level)
-                candidate_max = max(max_level, next_level)
-                if candidate_max - candidate_min > ALT_STAIRCASE_FLATTEN_MAX_STEP_M + 1e-6:
-                    break
-                end_run += 1
-                min_level = candidate_min
-                max_level = candidate_max
-            if end_run > start_run and max_level - min_level <= ALT_STAIRCASE_FLATTEN_MAX_STEP_M + 1e-6:
-                idx0 = runs[start_run][0]
-                idx1 = runs[end_run][1]
-                cluster_floor = max(float(z_min[idx]) for idx in range(idx0, idx1 + 1))
-                raw_candidates = {round(cluster_floor, 2)}
-                for ridx in range(start_run, end_run + 1):
-                    raw_candidates.add(round(runs[ridx][2], 2))
-                feasible_level = None
-                for candidate_level in sorted(raw_candidates):
-                    if candidate_level + 1e-6 < cluster_floor:
-                        continue
-                    if _can_assign_constant_profile_level(
-                        idx0,
-                        idx1,
-                        candidate_level,
-                        z=out,
-                        z_min=z_min,
-                        z_hard_cap=z_hard_cap,
-                        cum_dist_m=cum_dist_m,
-                        climb_ratio=climb_ratio,
-                        descend_ratio=descend_ratio,
-                    ):
-                        feasible_level = float(candidate_level)
-                        break
-                if feasible_level is not None:
-                    for idx in range(idx0, idx1 + 1):
-                        out[idx] = feasible_level
-                    changed = True
-                    run_idx = end_run + 1
-                    continue
-            run_idx += 1
-        if not changed:
-            break
-    return out
-
-
-def _point_to_segment_distance_m(
-    point: Tuple[float, float],
-    start: Tuple[float, float],
-    end: Tuple[float, float],
-) -> float:
-    dx = float(end[0] - start[0])
-    dy = float(end[1] - start[1])
-    seg_sq = dx * dx + dy * dy
-    if seg_sq <= 1e-9:
-        return math.hypot(point[0] - start[0], point[1] - start[1])
-    t = ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / seg_sq
-    t = _clip01(t)
-    proj_x = start[0] + dx * t
-    proj_y = start[1] + dy * t
-    return math.hypot(point[0] - proj_x, point[1] - proj_y)
-
-
-def compress_collinear_altitude_indices(
-    keep_idx: List[int],
-    samples_xy: List[Tuple[float, float]],
-    z: List[float],
-    z_min: List[float],
-    z_hard_cap: List[float],
-    cum_dist_m: List[float],
-    climb_ratio: float,
-    descend_ratio: float,
-    err_tol_m: float,
-    passes: int = 3,
-) -> List[int]:
-    if len(keep_idx) < 3:
-        return keep_idx
-    idxs = keep_idx[:]
-    link_err_tol_m = max(float(err_tol_m), HUMANIZE_ALTITUDE_LINK_ERR_TOL_M)
-    for _ in range(max(1, passes)):
-        changed = False
-        out: List[int] = [idxs[0]]
-        for pos in range(1, len(idxs) - 1):
-            prev_i = out[-1]
-            cur_i = idxs[pos]
-            next_i = idxs[pos + 1]
-            if prev_i >= cur_i or cur_i >= next_i:
-                out.append(cur_i)
-                continue
-            prev_pt = samples_xy[prev_i]
-            cur_pt = samples_xy[cur_i]
-            next_pt = samples_xy[next_i]
-            len_prev = math.hypot(cur_pt[0] - prev_pt[0], cur_pt[1] - prev_pt[1])
-            len_next = math.hypot(next_pt[0] - cur_pt[0], next_pt[1] - cur_pt[1])
-            if min(len_prev, len_next) > HUMANIZE_SHORT_SEGMENT_MAX_M:
-                out.append(cur_i)
-                continue
-            heading_prev = _segment_heading_deg(prev_pt, cur_pt)
-            heading_next = _segment_heading_deg(cur_pt, next_pt)
-            if _heading_gap_deg(heading_prev, heading_next) > HUMANIZE_COLLINEAR_HEADING_GAP_DEG:
-                out.append(cur_i)
-                continue
-            lateral_m = _point_to_segment_distance_m(cur_pt, prev_pt, next_pt)
-            if lateral_m > HUMANIZE_ALTITUDE_LATERAL_TOL_M:
-                out.append(cur_i)
-                continue
-            ds = max(1e-6, float(cum_dist_m[next_i] - cum_dist_m[prev_i]))
-            ratio = (cum_dist_m[cur_i] - cum_dist_m[prev_i]) / ds
-            z_interp = float(z[prev_i]) + (float(z[next_i]) - float(z[prev_i])) * ratio
-            if abs(z_interp - float(z[cur_i])) > HUMANIZE_ALTITUDE_INTERP_TOL_M:
-                out.append(cur_i)
-                continue
-            if z_interp + 1e-6 < z_min[cur_i] or z_interp > z_hard_cap[cur_i] + 1e-6:
-                out.append(cur_i)
-                continue
-            if not _can_link_profile_samples(
-                prev_i,
-                next_i,
-                z=z,
-                z_min=z_min,
-                z_hard_cap=z_hard_cap,
-                cum_dist_m=cum_dist_m,
-                climb_ratio=climb_ratio,
-                descend_ratio=descend_ratio,
-                err_tol_m=link_err_tol_m,
-            ):
-                out.append(cur_i)
-                continue
-            changed = True
-        out.append(idxs[-1])
-        idxs = out
-        if not changed or len(idxs) < 3:
-            break
-    return idxs
-
-
 def compress_altitude_waypoints(
     samples_xy: List[Tuple[float, float]],
     samples_wgs: List[Tuple[float, float]],
@@ -4818,17 +3292,6 @@ def compress_altitude_waypoints(
                 break
         keep_idx.append(chosen)
         cur = chosen
-    keep_idx = compress_collinear_altitude_indices(
-        keep_idx=keep_idx,
-        samples_xy=samples_xy,
-        z=z,
-        z_min=z_min,
-        z_hard_cap=z_hard_cap,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        err_tol_m=err_tol_m,
-    )
     out_wgs_alt: List[Tuple[float, float, float]] = []
     dedup = set()
     for i in keep_idx:
@@ -4865,12 +3328,6 @@ def plan_altitude_profile(
     min_true_height_m: float,
     max_true_height_m: float,
     endpoint_true_height_m: float,
-    endpoint_start_msl_override: Optional[float] = None,
-    endpoint_end_true_height_max_m: Optional[float] = None,
-    existing_route_index: Optional[Dict[str, Any]] = None,
-    existing_route_horizontal_buffer_m: float = EXISTING_ROUTE_HORIZONTAL_BUFFER_M,
-    existing_route_vertical_buffer_m: float = EXISTING_ROUTE_VERTICAL_BUFFER_M,
-    existing_route_relief_union_xy=None,
 ) -> Tuple[List[Tuple[float, float, float]], Dict[str, Any], List[Dict[str, float]]]:
     samples_xy, vertex_indices, cum_dist_m = sample_polyline_with_vertices(path_xy, spacing_m=ALT_PROFILE_SPACING_M)
     samples_wgs: List[Tuple[float, float]] = []
@@ -4888,14 +3345,6 @@ def plan_altitude_profile(
     obstacle_vals: List[float] = []
     building_hits = 0
     obstacle_hits = 0
-    existing_route_constraint_samples = 0
-    existing_route_required_min_profile = build_existing_route_required_min_profile(
-        samples_xy=samples_xy,
-        existing_route_index=existing_route_index,
-        horizontal_buffer_m=existing_route_horizontal_buffer_m,
-        vertical_buffer_m=existing_route_vertical_buffer_m,
-        relief_union_xy=existing_route_relief_union_xy,
-    )
     for i, p in enumerate(samples_xy):
         terrain = max(0.0, float(terrain_vals[i]))
         terrain_msl_vals.append(float(terrain))
@@ -4909,10 +3358,6 @@ def plan_altitude_profile(
             obstacle_hits += 1
         top_local = terrain + max(bh, oh)
         need = top_local + clearance_m
-        existing_required_min = existing_route_required_min_profile[i] if i < len(existing_route_required_min_profile) else None
-        if existing_required_min is not None:
-            need = max(need, float(existing_required_min))
-            existing_route_constraint_samples += 1
         z_min.append(need)
         top_surface_vals.append(top_local)
         agl_target.append(min(float(max_true_height_m), float(preferred_cruise_max_m)))
@@ -4941,8 +3386,6 @@ def plan_altitude_profile(
                 "obstacle_h_m": round(float(obstacle_vals[0]), 2),
                 "surface_clearance_m": round(clear0, 2),
                 "true_height_m": round(true0, 2),
-                "lon": round(float(lon), 8),
-                "lat": round(float(lat), 8),
             }
         ]
         meta_one = {
@@ -4967,8 +3410,6 @@ def plan_altitude_profile(
             "min_true_height_m_target": float(min_true_h),
             "max_true_height_m_target": float(max_true_h),
             "endpoint_true_height_m_target": float(endpoint_true_h),
-            "endpoint_start_msl_override_m": None if endpoint_start_msl_override is None else round(float(endpoint_start_msl_override), 2),
-            "endpoint_end_true_height_max_m": None if endpoint_end_true_height_max_m is None else round(float(endpoint_end_true_height_max_m), 2),
             "total_climb_m": 0.0,
             "total_descent_m": 0.0,
             "vertical_energy_proxy_m": 0.0,
@@ -4976,11 +3417,6 @@ def plan_altitude_profile(
             "max_descend_rate_ms": 0.0,
             "building_hit_count": int(building_hits),
             "obstacle_hit_count": int(obstacle_hits),
-            "existing_route_constraint_enabled": bool(existing_route_index and (existing_route_index.get("routes") or [])),
-            "existing_route_constraint_samples": int(existing_route_constraint_samples),
-            "existing_route_constraint_profile_precomputed": bool(existing_route_required_min_profile),
-            "existing_route_horizontal_buffer_m": float(existing_route_horizontal_buffer_m),
-            "existing_route_vertical_buffer_m": float(existing_route_vertical_buffer_m),
             "agl_target_mean_m": round(sum(agl_target) / len(agl_target), 2) if agl_target else 0.0,
             "profile_sample_count": 1,
         }
@@ -5020,22 +3456,10 @@ def plan_altitude_profile(
                 f"Altitude infeasible at {cum_dist_m[i]:.1f}m: lower bound exceeds hard ceiling"
             )
 
-    # Endpoint true-height targets are minimum targets (>=), unless an explicit
-    # end-point true-height cap is provided.
+    # Endpoint true height is a minimum target (>=), not a fixed value.
     endpoint_start_target = float(terrain_msl_vals[0]) + endpoint_true_h
     endpoint_end_target = float(terrain_msl_vals[-1]) + endpoint_true_h
-    if endpoint_end_true_height_max_m is not None:
-        end_cap_true_h = max(0.0, float(endpoint_end_true_height_max_m))
-        end_cap_msl = float(terrain_msl_vals[-1]) + end_cap_true_h
-        z_upper[-1] = min(z_upper[-1], end_cap_msl)
-        if z_lower[-1] > z_upper[-1] + 1e-6:
-            raise RuntimeError("Altitude infeasible at endpoint: landing-overhead true-height cap too strict")
     endpoint_start_msl = min(z_upper[0], max(z_lower[0], endpoint_start_target))
-    if endpoint_start_msl_override is not None:
-        start_msl_raw = float(endpoint_start_msl_override)
-        endpoint_start_msl = min(z_upper[0], max(z_lower[0], start_msl_raw))
-        if abs(endpoint_start_msl - start_msl_raw) > 1e-3:
-            raise RuntimeError("Altitude infeasible at start: cannot match main-route fork altitude under envelope limits")
     endpoint_end_msl = min(z_upper[-1], max(z_lower[-1], endpoint_end_target))
 
     climb_ratio = max(0.05, float(climb_ms) / max(0.5, float(speed_ms)))
@@ -5046,50 +3470,12 @@ def plan_altitude_profile(
     climb_need_dist = max(0.0, cruise_ref_msl - endpoint_start_msl) / climb_ratio
     descend_need_dist = max(0.0, cruise_ref_msl - endpoint_end_msl) / descend_ratio
 
-    # Low-altitude-biased target:
-    # - keep MSL stable when possible
-    # - delay climb until the propagated hard lower envelope actually requires it
-    # - only descend from a plateau when there is a sustained lower-altitude opportunity
-    z_desired: List[float] = [0.0] * n
-    hold_msl = float(endpoint_start_msl)
-    z_desired[0] = hold_msl
-    for i in range(1, n - 1):
-        floor_i = float(z_lower[i])
-        climb_window_max_floor = floor_i
-        climb_window_peak_dist = 0.0
-        j = i
-        climb_limit_dist = float(cum_dist_m[i]) + LOW_ALT_CLIMB_LOOKAHEAD_M
-        while j + 1 < n and float(cum_dist_m[j + 1]) <= climb_limit_dist:
-            j += 1
-            floor_j = float(z_lower[j])
-            if floor_j > climb_window_max_floor + 1e-6:
-                climb_window_max_floor = floor_j
-                climb_window_peak_dist = float(cum_dist_m[j] - cum_dist_m[i])
-        hold_cap = float(z_soft_cap_local[i]) + CRUISE_MSL_HOLD_TOL_M
-        if climb_window_max_floor > hold_msl + 1e-6:
-            climb_need_dist = (climb_window_max_floor - hold_msl) / max(1e-6, climb_ratio)
-            if (
-                climb_window_max_floor - hold_msl >= LOW_ALT_CLIMB_COMMIT_M
-                and climb_window_peak_dist <= climb_need_dist + LOW_ALT_CLIMB_MARGIN_M
-            ):
-                hold_msl = climb_window_max_floor
-        if hold_msl < floor_i:
-            hold_msl = floor_i
-        elif hold_msl - floor_i <= LOW_ALT_STEP_HOLD_M:
-            hold_msl = max(hold_msl, floor_i)
-        else:
-            j = i
-            window_max_floor = floor_i
-            limit_dist = float(cum_dist_m[i]) + LOW_ALT_DESCENT_LOOKAHEAD_M
-            while j + 1 < n and float(cum_dist_m[j + 1]) <= limit_dist:
-                j += 1
-                window_max_floor = max(window_max_floor, float(z_lower[j]))
-            if hold_msl - window_max_floor >= LOW_ALT_DESCENT_COMMIT_M:
-                hold_msl = window_max_floor
-        if hold_msl > hold_cap:
-            hold_msl = min(hold_msl, float(z_soft_cap_local[i]) + CRUISE_SOFT_CAP_RELAX_M)
-        z_desired[i] = min(z_upper[i], max(z_lower[i], hold_msl))
-    z_desired[-1] = float(endpoint_end_msl)
+    z_desired: List[float] = []
+    for i in range(n):
+        # Keep a long flat cruise baseline and only climb locally when hard bounds demand it.
+        target = max(cruise_ref_msl, z_lower[i])
+        target = min(target, z_soft_cap_local[i] + CRUISE_SOFT_CAP_RELAX_M)
+        z_desired.append(min(z_upper[i], max(z_lower[i], target)))
 
     z = z_desired[:]
 
@@ -5146,71 +3532,6 @@ def plan_altitude_profile(
         if not changed:
             break
 
-    z = regularize_altitude_plateaus(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        passes=4,
-    )
-    z = flatten_small_altitude_staircases(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        passes=3,
-    )
-    z = smooth_ascending_bridge_plateaus(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        passes=2,
-    )
-    z = smooth_ascending_plateau_starts(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        passes=2,
-    )
-    z = smooth_descending_bridge_plateaus(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        passes=2,
-    )
-    z = smooth_terminal_descent_profile(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-    )
-    z = snap_near_integer_altitude_plateaus(
-        z,
-        z_min=z_lower,
-        z_hard_cap=z_upper,
-        cum_dist_m=cum_dist_m,
-        climb_ratio=climb_ratio,
-        descend_ratio=descend_ratio,
-        passes=2,
-    )
-    z[0] = endpoint_start_msl
-    z[-1] = endpoint_end_msl
-
     out_wgs_alt = compress_altitude_waypoints(
         samples_xy=samples_xy,
         samples_wgs=samples_wgs,
@@ -5260,8 +3581,6 @@ def plan_altitude_profile(
                 "obstacle_h_m": round(float(obstacle_vals[i]), 2),
                 "surface_clearance_m": round(max(0.0, float(z[i]) - float(top_surface_vals[i])), 2),
                 "true_height_m": round(max(0.0, float(z[i]) - float(terrain_msl_vals[i])), 2),
-                "lon": round(float(samples_wgs[i][0]), 8),
-                "lat": round(float(samples_wgs[i][1]), 8),
             }
         )
     meta = {
@@ -5270,21 +3589,12 @@ def plan_altitude_profile(
         "altitude_points_raw": len(samples_xy),
         "route_soft_cap_msl_m": round(float(max(z_pref_cap_local)), 2) if z_pref_cap_local else 0.0,
         "cruise_soft_cap_relax_m": float(CRUISE_SOFT_CAP_RELAX_M),
-        "cruise_msl_hold_tol_m": float(CRUISE_MSL_HOLD_TOL_M),
-        "low_alt_descent_commit_m": float(LOW_ALT_DESCENT_COMMIT_M),
-        "low_alt_descent_lookahead_m": float(LOW_ALT_DESCENT_LOOKAHEAD_M),
-        "low_alt_step_hold_m": float(LOW_ALT_STEP_HOLD_M),
-        "low_alt_climb_commit_m": float(LOW_ALT_CLIMB_COMMIT_M),
-        "low_alt_climb_lookahead_m": float(LOW_ALT_CLIMB_LOOKAHEAD_M),
-        "low_alt_climb_margin_m": float(LOW_ALT_CLIMB_MARGIN_M),
         "cruise_reference_msl_m": round(float(cruise_ref_msl), 2),
         "planned_climb_phase_m": round(float(climb_need_dist), 2),
         "planned_descend_phase_m": round(float(descend_need_dist), 2),
         "endpoint_start_msl_m": round(float(endpoint_start_msl), 2),
         "endpoint_end_msl_m": round(float(endpoint_end_msl), 2),
         "endpoint_true_height_m_target": float(endpoint_true_h),
-        "endpoint_start_msl_override_m": None if endpoint_start_msl_override is None else round(float(endpoint_start_msl_override), 2),
-        "endpoint_end_true_height_max_m": None if endpoint_end_true_height_max_m is None else round(float(endpoint_end_true_height_max_m), 2),
         "min_true_height_m_target": float(min_true_h),
         "max_true_height_m_target": float(max_true_h),
         "total_climb_m": round(float(total_climb_m), 2),
@@ -5309,11 +3619,6 @@ def plan_altitude_profile(
         "hard_ceiling_m": float(hard_ceiling_m),
         "building_hit_count": building_hits,
         "obstacle_hit_count": obstacle_hits,
-        "existing_route_constraint_enabled": bool(existing_route_index and (existing_route_index.get("routes") or [])),
-        "existing_route_constraint_samples": int(existing_route_constraint_samples),
-        "existing_route_constraint_profile_precomputed": bool(existing_route_required_min_profile),
-        "existing_route_horizontal_buffer_m": float(existing_route_horizontal_buffer_m),
-        "existing_route_vertical_buffer_m": float(existing_route_vertical_buffer_m),
         "agl_target_mean_m": round(sum(agl_target) / len(agl_target), 2) if agl_target else 0.0,
         "profile_sample_count": len(profile_samples),
     }
@@ -5328,42 +3633,6 @@ def write_kml_absolute(path: Path, points_wgs_alt: List[Tuple[float, float, floa
 <Placemark><name>{name}</name><Style><LineStyle><color>ff2a6df4</color><width>4</width></LineStyle></Style>
 <LineString><extrude>1</extrude><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{coords}</coordinates></LineString></Placemark>
 </Document></kml>"""
-    path.write_text(text, encoding="utf-8")
-
-
-def write_emergency_routes_kml(path: Path, routes: List[Dict[str, Any]], name: str) -> None:
-    placemarks: List[str] = []
-    for item in routes:
-        route_name = str(item.get("name", "应急航线"))
-        points = item.get("points_wgs_alt") or []
-        if not isinstance(points, list) or len(points) < 2:
-            continue
-        coords_tokens: List[str] = []
-        for p in points:
-            try:
-                lon = float(p[0])
-                lat = float(p[1])
-                alt = float(p[2])
-            except Exception:
-                continue
-            coords_tokens.append(f"{lon:.8f},{lat:.8f},{alt:.2f}")
-        if len(coords_tokens) < 2:
-            continue
-        coords = " ".join(coords_tokens)
-        placemarks.append(
-            "<Placemark>"
-            f"<name>{html.escape(route_name)}</name>"
-            "<Style><LineStyle><color>ff1b5e20</color><width>3</width></LineStyle></Style>"
-            f"<LineString><extrude>1</extrude><tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>{coords}</coordinates></LineString>"
-            "</Placemark>"
-        )
-    text = (
-        '<?xml version="1.0" encoding="UTF-8"?>'
-        '<kml xmlns="http://www.opengis.net/kml/2.2"><Document>'
-        f"<name>{html.escape(name)}</name>"
-        + "".join(placemarks)
-        + "</Document></kml>"
-    )
     path.write_text(text, encoding="utf-8")
 
 
@@ -6073,7 +4342,7 @@ def _build_profile_panel_html(
     width = 1100.0
     height = 280.0
     left = 64.0
-    right = 62.0
+    right = 18.0
     top = 20.0
     bottom = 36.0
     plot_w = width - left - right
@@ -6085,7 +4354,6 @@ def _build_profile_panel_html(
     default_id = str(default_profile_variant_id or "")
     if default_id not in variant_ids:
         default_id = variant_ids[0]
-    legend_focus_h = float(EXISTING_ROUTE_HORIZONTAL_BUFFER_M)
     for vid in variant_ids:
         item = profile_variants.get(vid) or {}
         samples = _downsample_profile_samples(item.get("samples") or [], max_points=260)
@@ -6093,9 +4361,7 @@ def _build_profile_panel_html(
             continue
         label = str(item.get("label", vid))
         quality_variant = quality_variants.get(vid) or {}
-        existing_route_profile_markers = item.get("existing_route_profile_markers") or []
         dist_max = max(1.0, float(samples[-1].get("distance_m", 0.0)))
-        takeoff_ground_msl = float(samples[0].get("terrain_msl_m", 0.0))
         vals = []
         for s in samples:
             vals.append(float(s.get("route_alt_msl_m", 0.0)))
@@ -6116,12 +4382,8 @@ def _build_profile_panel_html(
             grid_parts.append(
                 f'<line x1="{left:.1f}" y1="{y:.2f}" x2="{left + plot_w:.1f}" y2="{y:.2f}" stroke="#e0e0e0" stroke-width="1"/>'
             )
-            rel_v = v - takeoff_ground_msl
             label_parts.append(
-                f'<text x="{left - 8:.1f}" y="{y + 4:.2f}" text-anchor="end" fill="#616161" font-size="11">{rel_v:.0f}</text>'
-            )
-            label_parts.append(
-                f'<text x="{left + plot_w + 8:.1f}" y="{y + 4:.2f}" text-anchor="start" fill="#616161" font-size="11">{v:.0f}</text>'
+                f'<text x="{left - 8:.1f}" y="{y + 4:.2f}" text-anchor="end" fill="#616161" font-size="11">{v:.0f}</text>'
             )
 
         x_ticks = 6
@@ -6138,33 +4400,11 @@ def _build_profile_panel_html(
         terrain_path = _svg_path(samples, "terrain_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
         surface_path = _svg_path(samples, "surface_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
         route_path = _svg_path(samples, "route_alt_msl_m", left, top, plot_w, plot_h, dist_max, h_min, h_max)
-        marker_parts: List[str] = []
-        span_h = max(1e-6, h_max - h_min)
-        for marker in existing_route_profile_markers[: max(1, int(EXISTING_ROUTE_PROFILE_MARKER_MAX_POINTS))]:
-            dist_m = _safe_float(marker.get("distance_m", 0.0), 0.0)
-            existing_alt_msl = _safe_float(marker.get("existing_alt_msl_m", 0.0), 0.0)
-            x = left + (dist_m / max(1e-6, dist_max)) * plot_w
-            y = top + (1.0 - (existing_alt_msl - h_min) / span_h) * plot_h
-            tooltip = (
-                f"{dist_m/1000.0:.3f} km | 水平 {abs(_safe_float(marker.get('horizontal_m', 0.0), 0.0)):.1f} m | "
-                f"已有 {existing_alt_msl:.1f} m MSL | 主航线 {_safe_float(marker.get('candidate_alt_msl_m', 0.0), 0.0):.1f} m MSL | "
-                f"Δh(MSL) {_safe_float(marker.get('delta_alt_msl_m', 0.0), 0.0):+.1f} m | "
-                f"{str(marker.get('route_name', '') or '未命名航线')}"
-            )
-            marker_parts.append(
-                f'<circle cx="{x:.2f}" cy="{y:.2f}" r="3.6" fill="#c62828" stroke="#ffffff" stroke-width="1.1">'
-                f"<title>{html.escape(tooltip)}</title></circle>"
-            )
         true_vals = [float(s.get("true_height_m", 0.0)) for s in samples]
         min_true = min(true_vals) if true_vals else 0.0
         mean_true = (sum(true_vals) / len(true_vals)) if true_vals else 0.0
         selected = " selected" if vid == default_id else ""
         hidden_cls = "" if vid == default_id else " is-hidden"
-        if vid == default_id:
-            legend_focus_h = _safe_float(
-                item.get("existing_route_marker_focus_horizontal_m", EXISTING_ROUTE_HORIZONTAL_BUFFER_M),
-                EXISTING_ROUTE_HORIZONTAL_BUFFER_M,
-            )
         options_html.append(f'<option value="{html.escape(vid)}"{selected}>{html.escape(label)}</option>')
         variants_html.append(
             f"""
@@ -6175,12 +4415,9 @@ def _build_profile_panel_html(
       {_build_quality_summary_html(quality_variant)}
       <svg viewBox="0 0 {width:.0f} {height:.0f}" class="route-profile-panel__chart">
         {''.join(grid_parts)}
-        <text x="16" y="{top + plot_h / 2:.1f}" text-anchor="middle" fill="#546e7a" font-size="11" transform="rotate(-90 16 {top + plot_h / 2:.1f})">相对起飞点地面高度 (m)</text>
-        <text x="{width - 16:.1f}" y="{top + plot_h / 2:.1f}" text-anchor="middle" fill="#546e7a" font-size="11" transform="rotate(90 {width - 16:.1f} {top + plot_h / 2:.1f})">海拔高度 MSL (m)</text>
         <polyline fill="none" stroke="#94a9b8" stroke-width="2" points="{terrain_path}"/>
         <polyline fill="none" stroke="#8d6e63" stroke-width="2.5" points="{surface_path}"/>
         <polyline fill="none" stroke="#1e5ea8" stroke-width="2.8" points="{route_path}"/>
-        {''.join(marker_parts)}
         {''.join(label_parts)}
       </svg>
     </div>
@@ -6209,7 +4446,6 @@ def _build_profile_panel_html(
       <span><span class="route-profile-panel__line route-profile-panel__line--route"></span>航线高度（MSL）</span>
       <span><span class="route-profile-panel__line route-profile-panel__line--surface"></span>地表顶面（地形+建筑/障碍物）</span>
       <span><span class="route-profile-panel__line route-profile-panel__line--terrain"></span>地形高度（MSL）</span>
-      <span><span class="route-profile-panel__dot route-profile-panel__dot--existing"></span>已有航线高度点（MSL，水平≤{int(round(legend_focus_h))}m）</span>
     </div>
   </div>
 </div>
@@ -6388,13 +4624,6 @@ def _build_preview_theme_head_html() -> str:
     padding-right: 3px;
   }
 
-  .route-map-toolbar__status-summary {
-    margin-bottom: 6px;
-    font-size: 11px;
-    line-height: 1.35;
-    color: #5c748b;
-  }
-
   .route-map-toolbar__group {
     margin-top: 6px;
     margin-bottom: 2px;
@@ -6423,56 +4652,11 @@ def _build_preview_theme_head_html() -> str:
     line-height: 1.35;
   }
 
-  .route-toggle__text {
-    flex: 1 1 auto;
-    min-width: 0;
-  }
-
   .route-toggle input {
     margin: 0;
     width: 15px;
     height: 15px;
     accent-color: var(--accent);
-  }
-
-  .route-layer-badge {
-    margin-left: auto;
-    border-radius: 999px;
-    border: 1px solid transparent;
-    padding: 1px 7px;
-    font-size: 11px;
-    font-weight: 700;
-    line-height: 1.5;
-    white-space: nowrap;
-  }
-
-  .route-native-layer-badge {
-    margin-left: 8px;
-    vertical-align: middle;
-  }
-
-  .route-layer-badge--full {
-    color: #1b5e20;
-    background: #e9f7ee;
-    border-color: #b8dfc3;
-  }
-
-  .route-layer-badge--partial {
-    color: #8a5900;
-    background: #fff6dd;
-    border-color: #f0d692;
-  }
-
-  .route-layer-badge--no_hit {
-    color: #145a86;
-    background: #e6f4ff;
-    border-color: #b7daf3;
-  }
-
-  .route-layer-badge--missing {
-    color: #8b1f2a;
-    background: #fdecef;
-    border-color: #f3bcc4;
   }
 
   .route-map-toolbar__actions {
@@ -7025,20 +5209,6 @@ def _build_preview_theme_head_html() -> str:
     background: #94a9b8;
   }
 
-  .route-profile-panel__dot {
-    display: inline-block;
-    width: 8px;
-    height: 8px;
-    border-radius: 999px;
-    vertical-align: middle;
-    margin-right: 6px;
-  }
-
-  .route-profile-panel__dot--existing {
-    background: #c62828;
-    box-shadow: 0 0 0 1px #ffffff;
-  }
-
   .route-profile-panel.is-collapsed .route-profile-panel__body {
     display: none;
   }
@@ -7095,7 +5265,6 @@ def _build_preview_theme_head_html() -> str:
       grid-template-columns: 1fr;
       gap: 3px;
     }
-
   }
 </style>
 """
@@ -7105,19 +5274,16 @@ def _build_preview_toolbar_script_html(
     name: str,
     route_variants: Dict[str, Dict[str, Any]],
     default_route_variant_id: str,
-    layer_status_catalog: Dict[str, Dict[str, Any]],
 ) -> str:
     route_variants_json = json.dumps(route_variants, ensure_ascii=False)
     default_variant_json = json.dumps(str(default_route_variant_id or "safety_default"), ensure_ascii=False)
     route_name_json = json.dumps(str(name), ensure_ascii=False)
-    layer_status_catalog_json = json.dumps(layer_status_catalog, ensure_ascii=False)
     template = """
 <script>
 (function () {
   const routeEditorVariants = __ROUTE_VARIANTS_JSON__;
   const routeEditorDefaultId = __ROUTE_DEFAULT_ID_JSON__;
   const routeEditorName = __ROUTE_NAME_JSON__;
-  const layerStatusCatalog = __LAYER_STATUS_CATALOG_JSON__;
 
   function hasAny(text, keywords) {
     const source = String(text || "");
@@ -7128,7 +5294,6 @@ def _build_preview_toolbar_script_html(
 
   function groupName(layerName) {
     if (hasAny(layerName, ["候选航线", "Candidate:", "主航线", "Route (3D", "安全优先", "效率优先"])) return "航线方案";
-    if (hasAny(layerName, ["已有航线", "放松区"])) return "安全边界";
     if (hasAny(layerName, ["禁飞", "No-fly", "缓冲", "Buffer", "GRB", "起点", "Start/End"])) return "安全边界";
     if (hasAny(layerName, ["高层", "High Buildings", "建筑", "学校", "School", "人群", "Crowd", "敏感设施", "关键基础设施", "Line Risks", "低风险", "人口密度", "土地利用"])) return "风险参考";
     return "其他";
@@ -7336,14 +5501,6 @@ def _build_preview_toolbar_script_html(
     return String(name || "").replace(/\\s+/g, " ").trim();
   }
 
-  function statusForLayer(name) {
-    const key = normalizeLayerName(name);
-    if (!key) return null;
-    const obj = layerStatusCatalog && layerStatusCatalog[key];
-    if (!obj || typeof obj !== "object") return null;
-    return obj;
-  }
-
   function readNativeLayerEntries() {
     const root = document.querySelector(".leaflet-control-layers");
     if (!root) return { base: [], overlays: [] };
@@ -7403,44 +5560,6 @@ def _build_preview_toolbar_script_html(
     if (el) el.classList.add("route-native-hidden");
   }
 
-  function decorateNativeLayerLabels() {
-    const root = document.querySelector(".leaflet-control-layers");
-    if (!root) return;
-    const labels = Array.from(root.querySelectorAll(".leaflet-control-layers-overlays label"));
-    labels.forEach(function (label) {
-      if (!label) return;
-      const input = label.querySelector("input.leaflet-control-layers-selector");
-      if (!input) return;
-      let baseName = String(label.dataset.layerBaseName || "");
-      if (!baseName) {
-        const clone = label.cloneNode(true);
-        const prior = clone.querySelector(".route-native-layer-badge");
-        if (prior) prior.remove();
-        baseName = normalizeLayerName(clone.textContent || "");
-        if (baseName) label.dataset.layerBaseName = baseName;
-      }
-      const status = statusForLayer(baseName);
-      label.querySelectorAll(".route-native-layer-badge").forEach(function (node) {
-        node.remove();
-      });
-      if (!status) return;
-      const badge = document.createElement("span");
-      const level = String(status.level || "");
-      badge.className = "route-layer-badge route-native-layer-badge" + (level ? " route-layer-badge--" + level : "");
-      badge.textContent = String(status.badge || status.label || "状态");
-      if (status.detail) badge.title = String(status.detail);
-      label.appendChild(badge);
-      const auxBadges = Array.isArray(status.aux_badges) ? status.aux_badges : [];
-      auxBadges.forEach(function (textVal) {
-        const aux = document.createElement("span");
-        aux.className = "route-layer-badge route-native-layer-badge route-layer-badge--no_hit";
-        aux.textContent = String(textVal || "");
-        if (status.detail) aux.title = String(status.detail);
-        label.appendChild(aux);
-      });
-    });
-  }
-
   function setupToolbar(map) {
     if (!map || map._routeToolbarReady) return true;
     const catalog = findLayerCatalog();
@@ -7484,7 +5603,6 @@ def _build_preview_toolbar_script_html(
       '<div class="route-map-toolbar__label">图层</div>' +
       '<button type="button" class="route-map-toolbar__collapse" data-role="layers-toggle">收起</button>' +
       '</div>' +
-      '<div class="route-map-toolbar__status-summary" data-role="status-summary"></div>' +
       '<div class="route-map-toolbar__layers" data-role="layers"></div>' +
       '</div>' +
       '<div class="route-map-toolbar__actions">' +
@@ -7495,7 +5613,6 @@ def _build_preview_toolbar_script_html(
 
     const baseWrap = toolbar.querySelector('[data-role="base"]');
     const layerWrap = toolbar.querySelector('[data-role="layers"]');
-    const statusSummary = toolbar.querySelector('[data-role="status-summary"]');
     const baseButtons = [];
     const overlayInputs = [];
     const satLabels = overlayEntries.find(function (entry) {
@@ -7570,7 +5687,6 @@ def _build_preview_toolbar_script_html(
       empty.textContent = "未读取到可切换图层，请刷新页面后重试。";
       layerWrap.appendChild(empty);
     } else {
-      const statusCounts = { full: 0, partial: 0, missing: 0, no_hit: 0 };
       let currentGroup = "";
       grouped.forEach(function (item) {
         if (item.group !== currentGroup) {
@@ -7583,13 +5699,6 @@ def _build_preview_toolbar_script_html(
         const row = document.createElement("label");
         row.className = "route-toggle";
         const input = document.createElement("input");
-        const status = statusForLayer(item.label);
-        if (status && status.level && Object.prototype.hasOwnProperty.call(statusCounts, status.level)) {
-          statusCounts[status.level] += 1;
-        }
-        if (status && status.no_hit) {
-          statusCounts.no_hit += 1;
-        }
         input.type = "checkbox";
         input.checked = item.entry.input
           ? !!item.entry.input.checked
@@ -7603,38 +5712,12 @@ def _build_preview_toolbar_script_html(
           });
         }
         const text = document.createElement("span");
-        text.className = "route-toggle__text";
         text.textContent = item.label;
         row.appendChild(input);
         row.appendChild(text);
-        if (status) {
-          const badge = document.createElement("span");
-          const level = String(status.level || "");
-          badge.className = "route-layer-badge" + (level ? " route-layer-badge--" + level : "");
-          badge.textContent = String(status.badge || status.label || "状态");
-          if (status.detail) badge.title = String(status.detail);
-          row.appendChild(badge);
-          const auxBadges = Array.isArray(status.aux_badges) ? status.aux_badges : [];
-          auxBadges.forEach(function (textVal) {
-            const aux = document.createElement("span");
-            aux.className = "route-layer-badge route-layer-badge--no_hit";
-            aux.textContent = String(textVal || "");
-            if (status.detail) aux.title = String(status.detail);
-            row.appendChild(aux);
-          });
-        }
         layerWrap.appendChild(row);
         overlayInputs.push({ entry: item.entry, input: input });
       });
-      if (statusSummary) {
-        const parts = [];
-        if (statusCounts.full > 0) parts.push("充分 " + statusCounts.full);
-        if (statusCounts.partial > 0) parts.push("有限 " + statusCounts.partial);
-        if (statusCounts.no_hit > 0) parts.push("未命中 " + statusCounts.no_hit);
-        if (statusCounts.missing > 0) parts.push("缺失 " + statusCounts.missing);
-        statusSummary.textContent = parts.length ? "数据状态: " + parts.join(" · ") : "";
-        statusSummary.style.display = parts.length ? "block" : "none";
-      }
     }
 
     function applyPreset(mode) {
@@ -8534,13 +6617,7 @@ def _build_preview_toolbar_script_html(
     });
     if (!map) return false;
     setupPanelLayout(map);
-    // Custom map toolbar is disabled by product decision.
     const readyEditor = setupRouteEditor(map);
-    decorateNativeLayerLabels();
-    if (!map._routeNativeLabelDecorated) {
-      map.on("overlayadd overlayremove baselayerchange", decorateNativeLayerLabels);
-      map._routeNativeLabelDecorated = true;
-    }
     triggerPanelLayout();
     return !!readyEditor;
   }
@@ -8560,7 +6637,6 @@ def _build_preview_toolbar_script_html(
         template.replace("__ROUTE_VARIANTS_JSON__", route_variants_json)
         .replace("__ROUTE_DEFAULT_ID_JSON__", default_variant_json)
         .replace("__ROUTE_NAME_JSON__", route_name_json)
-        .replace("__LAYER_STATUS_CATALOG_JSON__", layer_status_catalog_json)
     )
 
 
@@ -8571,18 +6647,10 @@ def write_preview_html(
     quality_variants: Dict[str, Dict[str, Any]],
     start_wgs: Tuple[float, float],
     end_wgs: Tuple[float, float],
-    custom_no_fly_polys_xy: List[Any],
     civil_airport_polys_xy: List[Any],
     military_hard_nofly_polys_xy: List[Any],
     heli_soft_nofly_polys_xy: List[Any],
-    existing_route_lines_xy: List[Any],
-    existing_route_corridors_xy: List[Any],
-    existing_route_relief_union_xy,
-    existing_route_horizontal_buffer_m: float,
-    existing_route_vertical_buffer_m: float,
-    existing_route_endpoint_relief_m: float,
     route_buffer_xy,
-    emergency_routes: Optional[List[Dict[str, Any]]],
     dynamic_grb_xy,
     population_points_wgs: List[Dict[str, float]],
     population_tiles_template: str,
@@ -8606,9 +6674,8 @@ def write_preview_html(
     key_point_tooltips_xy: Dict[Tuple[float, float], str],
     inv,
     name: str,
-    layer_source_status: Optional[Dict[str, Any]] = None,
 ) -> None:
-    def _poly_to_latlon(poly_wgs):
+    def _poly_to_latlon(poly_wgs) -> List[Tuple[float, float]]:
         return [(lat, lon) for lon, lat in poly_wgs.exterior.coords]
 
     def _add_polygon_layer(
@@ -8778,10 +6845,8 @@ def write_preview_html(
             "fallback_label": "效率优先",
         },
     }
-    source_status = layer_source_status or {}
     route_variants_for_editor: Dict[str, Dict[str, Any]] = {}
     profile_variants_for_panel: Dict[str, Dict[str, Any]] = {}
-    route_buffer_variants_xy: Dict[str, Any] = {}
     default_variant_id = "safety_default"
     for cand in candidate_routes_wgs:
         cid = str(cand.get("id", "candidate"))
@@ -8817,15 +6882,9 @@ def write_preview_html(
             default_variant_id = cid
         label = str(cand.get("label", style["fallback_label"]))
         route_variants_for_editor[cid] = {"label": label, "points": points_for_editor}
-        route_buffer_variants_xy[cid] = cand.get("route_buffer_xy")
         profile_samples_variant = cand.get("profile_samples") or []
         if isinstance(profile_samples_variant, list) and len(profile_samples_variant) >= 2:
-            profile_variants_for_panel[cid] = {
-                "label": label,
-                "samples": profile_samples_variant,
-                "existing_route_profile_markers": cand.get("existing_route_profile_markers") or [],
-                "existing_route_marker_focus_horizontal_m": float(existing_route_horizontal_buffer_m),
-            }
+            profile_variants_for_panel[cid] = {"label": label, "samples": profile_samples_variant}
 
         route_layer = folium.FeatureGroup(name=style["layer_name"], show=True)
         distance_km = _safe_float(cand.get("distance_km", 0.0), 0.0)
@@ -8875,76 +6934,6 @@ def write_preview_html(
         if route_buffer_xy is not None and (not route_buffer_xy.is_empty):
             _add_polygon_layer(fallback_buf, [route_buffer_xy], color="#1e88e5", fill_opacity=0.08, max_items=1)
         fallback_buf.add_to(m)
-        route_buffer_variants_xy["safety_default"] = route_buffer_xy
-
-    emergency_branch_layer = folium.FeatureGroup(name="应急航线（备降）", show=True)
-    emergency_buffer_layer = folium.FeatureGroup(name=f"应急航线缓冲区 {int(ROUTE_BUFFER_M)}m", show=False)
-    emergency_fork_layer = folium.FeatureGroup(name="应急分叉点", show=False)
-    emergency_landing_layer = folium.FeatureGroup(name="应急备降点", show=True)
-    for item in emergency_routes or []:
-        points = item.get("points_wgs_alt") or []
-        coords = []
-        for p in points:
-            try:
-                coords.append((float(p[1]), float(p[0])))
-            except Exception:
-                continue
-        if len(coords) >= 2:
-            seg_idx = int(_safe_float(item.get("segment_index", -1), -1))
-            branch_len = _safe_float(item.get("branch_length_m", 0.0), 0.0)
-            wp_cnt = int(_safe_float(item.get("branch_waypoint_count", 0), 0.0))
-            fork_ang = _safe_float(item.get("fork_interior_angle_deg", 0.0), 0.0)
-            ltype = str(item.get("landing_type_label", "应急备降点"))
-            tip = f"应急支线 S{seg_idx + 1} | 长度 {branch_len:.1f} m | 航段点 {wp_cnt} | 分叉角 {fork_ang:.1f}° | 落点 {ltype}"
-            folium.PolyLine(
-                coords,
-                color="#2e7d32",
-                weight=3,
-                opacity=0.92,
-                tooltip=tip,
-            ).add_to(emergency_branch_layer)
-        branch_buffer_xy = item.get("branch_buffer_xy")
-        if branch_buffer_xy is not None and (not getattr(branch_buffer_xy, "is_empty", True)):
-            _add_polygon_layer(
-                emergency_buffer_layer,
-                [branch_buffer_xy],
-                color="#43a047",
-                fill_opacity=0.1,
-                max_items=1,
-            )
-        fork_wgs = item.get("fork_wgs") or {}
-        landing_wgs = item.get("landing_wgs") or {}
-        try:
-            fork_lat = float(fork_wgs.get("lat"))
-            fork_lon = float(fork_wgs.get("lon"))
-            folium.CircleMarker(
-                [fork_lat, fork_lon],
-                radius=4,
-                color="#1b5e20",
-                fill=True,
-                fill_opacity=0.95,
-                tooltip=f"应急分叉点 S{int(_safe_float(item.get('segment_index', -1), -1)) + 1}",
-            ).add_to(emergency_fork_layer)
-        except Exception:
-            pass
-        try:
-            land_lat = float(landing_wgs.get("lat"))
-            land_lon = float(landing_wgs.get("lon"))
-            folium.Marker(
-                [land_lat, land_lon],
-                tooltip=(
-                    f"应急备降点 S{int(_safe_float(item.get('segment_index', -1), -1)) + 1}"
-                    f" | {str(item.get('landing_type_label', '备降点'))}"
-                ),
-                icon=folium.Icon(color="darkgreen", icon="plus", prefix="fa"),
-            ).add_to(emergency_landing_layer)
-        except Exception:
-            pass
-    emergency_branch_layer.add_to(m)
-    emergency_buffer_layer.add_to(m)
-    emergency_fork_layer.add_to(m)
-    emergency_landing_layer.add_to(m)
-
     dyn_grb_layer = folium.FeatureGroup(name="动态 GRB（AGL 1:1）", show=False)
     if dynamic_grb_xy is not None and (not dynamic_grb_xy.is_empty):
         _add_polygon_layer(dyn_grb_layer, [dynamic_grb_xy], color="#26a69a", fill_opacity=0.1, max_items=1)
@@ -8990,10 +6979,6 @@ def write_preview_html(
             ).add_to(pop_layer)
         pop_layer.add_to(m)
 
-    custom_nofly_layer = folium.FeatureGroup(name="自定义禁飞区（用户）", show=True)
-    _add_polygon_layer(custom_nofly_layer, custom_no_fly_polys_xy, color="#ad1457", fill_opacity=0.24, max_items=1200)
-    custom_nofly_layer.add_to(m)
-
     civil_airport_layer = folium.FeatureGroup(name="民航机场禁飞区（CAAC）", show=True)
     _add_polygon_layer(civil_airport_layer, civil_airport_polys_xy, color="#7b1fa2", fill_opacity=0.2, max_items=260)
     civil_airport_layer.add_to(m)
@@ -9005,36 +6990,6 @@ def write_preview_html(
     heli_soft_layer = folium.FeatureGroup(name="直升机场避让区（软约束）", show=True)
     _add_polygon_layer(heli_soft_layer, heli_soft_nofly_polys_xy, color="#ef6c00", fill_opacity=0.16, max_items=260)
     heli_soft_layer.add_to(m)
-
-    existing_route_line_layer = folium.FeatureGroup(name="已有航线中心线", show=True)
-    _add_line_layer(
-        existing_route_line_layer,
-        existing_route_lines_xy,
-        color="#5e35b1",
-        max_items=EXISTING_ROUTE_LAYER_MAX_ITEMS,
-    )
-    existing_route_line_layer.add_to(m)
-
-    existing_route_corridor_layer = folium.FeatureGroup(
-        name=f"已有航线避让区（水平±{int(round(existing_route_horizontal_buffer_m))}m/垂直±{int(round(existing_route_vertical_buffer_m))}m）",
-        show=True,
-    )
-    _add_polygon_layer(
-        existing_route_corridor_layer,
-        existing_route_corridors_xy,
-        color="#00695c",
-        fill_opacity=0.12,
-        max_items=EXISTING_ROUTE_LAYER_MAX_ITEMS,
-    )
-    existing_route_corridor_layer.add_to(m)
-
-    existing_route_relief_layer = folium.FeatureGroup(
-        name=f"起降点放松区（已有航线约束 {int(round(existing_route_endpoint_relief_m))}m）",
-        show=False,
-    )
-    if existing_route_relief_union_xy is not None and (not existing_route_relief_union_xy.is_empty):
-        _add_polygon_layer(existing_route_relief_layer, [existing_route_relief_union_xy], color="#00acc1", fill_opacity=0.09, max_items=1)
-    existing_route_relief_layer.add_to(m)
 
     landuse_layer = folium.FeatureGroup(name="土地利用", show=False)
     _add_landuse_layer(landuse_layer, landuse_geoms_xy, landuse_costs)
@@ -9117,226 +7072,6 @@ def write_preview_html(
     folium.Marker([end_wgs[1], end_wgs[0]], tooltip="终点", icon=folium.Icon(color="red")).add_to(start_end_layer)
     start_end_layer.add_to(m)
 
-    selected_quality = quality_variants.get(default_variant_id) or (next(iter(quality_variants.values())) if quality_variants else {})
-    selected_overall = (selected_quality.get("overall", {}) or {}) if isinstance(selected_quality, dict) else {}
-    selected_layer_details = (selected_overall.get("layer_details", {}) or {}) if isinstance(selected_overall, dict) else {}
-    selected_buffer_xy = route_buffer_variants_xy.get(default_variant_id)
-    if selected_buffer_xy is None or getattr(selected_buffer_xy, "is_empty", True):
-        selected_buffer_xy = route_buffer_xy
-
-    def _normalize_layer_key(layer_name: str) -> str:
-        return re.sub(r"\s+", " ", str(layer_name or "")).strip()
-
-    def _layer_quality(layer_key: str) -> Tuple[float, float]:
-        detail = selected_layer_details.get(layer_key, {}) if isinstance(selected_layer_details, dict) else {}
-        if not isinstance(detail, dict):
-            detail = {}
-        score = _safe_float(detail.get("score", 0.0), 0.0)
-        support = _safe_float(detail.get("route_support", 0.0), 0.0)
-        return score, support
-
-    def _count_geom_hits(geoms: List[Any], max_scan: int = 2500) -> int:
-        if selected_buffer_xy is None or getattr(selected_buffer_xy, "is_empty", True):
-            return 0
-        hits = 0
-        for geom in geoms[: max(1, int(max_scan))]:
-            try:
-                if geom is not None and (not geom.is_empty) and geom.intersects(selected_buffer_xy):
-                    hits += 1
-            except Exception:
-                continue
-        return hits
-
-    def _line_overlap_m(geoms: List[Any], max_scan: int = 2200) -> float:
-        if selected_buffer_xy is None or getattr(selected_buffer_xy, "is_empty", True):
-            return 0.0
-        total_m = 0.0
-        for geom in geoms[: max(1, int(max_scan))]:
-            try:
-                if geom is None or geom.is_empty:
-                    continue
-                total_m += float(geom.intersection(selected_buffer_xy).length)
-            except Exception:
-                continue
-        return total_m
-
-    def _compose_layer_status(acquired: bool, route_hit: bool, score: float, support: float, missing_reason: str) -> Dict[str, Any]:
-        badge_map = {
-            "full": "充分",
-            "partial": "有限",
-            "missing": "缺失",
-        }
-        score_c = _clip01(score)
-        support_c = _clip01(support)
-        ratio_pct: Optional[int] = int(round(100.0 * _clip01(0.55 * support_c + 0.45 * score_c)))
-        aux_badges: List[str] = []
-        no_hit_flag = False
-        if not acquired:
-            level = "missing"
-            detail = f"获取: 缺失; 覆盖: 无法评估。{missing_reason}"
-            badge = badge_map[level]
-            ratio_pct = None
-        else:
-            if score >= 0.72:
-                level = "full"
-                ratio_pct = None
-                detail = f"获取: 已获取; 覆盖: 充分 (Q={score:.2f}, S={support:.2f})。"
-                badge = badge_map[level]
-            else:
-                level = "partial"
-                if route_hit:
-                    detail = f"获取: 已获取; 覆盖: 有限 (Q={score:.2f}, S={support:.2f}, 估计覆盖≈{ratio_pct}%)。"
-                    badge = f"{badge_map[level]} {ratio_pct}%"
-                else:
-                    ratio_pct = None
-                    detail = f"获取: 已获取; 覆盖: 有限 (Q={score:.2f}, S={support:.2f})。"
-                    badge = badge_map[level]
-            if not route_hit:
-                no_hit_flag = True
-                aux_badges.append("未命中")
-                detail += " 航线缓冲区未命中对象。"
-        return {"level": level, "badge": badge, "detail": detail, "ratio_pct": ratio_pct, "no_hit": no_hit_flag, "aux_badges": aux_badges}
-
-    population_score, population_support = _layer_quality("population")
-    landuse_score, landuse_support = _layer_quality("landuse")
-    building_score, building_support = _layer_quality("building_obstacle")
-    nofly_score, nofly_support = _layer_quality("no_fly_sensitive")
-    poi_score, poi_support = _layer_quality("poi")
-    transport_score, transport_support = _layer_quality("transport_hydro")
-
-    population_source_ready = bool(source_status.get("population_source_ready", False))
-    landuse_source_ready = bool(source_status.get("landuse_source_ready", False))
-    poi_source_ready = bool(source_status.get("poi_source_ready", False))
-    transport_source_ready = bool(source_status.get("transport_source_ready", False))
-    building_source_ready = bool(source_status.get("building_source_ready", False))
-    school_source_ready = bool(source_status.get("school_source_ready", False))
-    civil_airport_source_ready = bool(source_status.get("civil_airport_source_ready", False))
-    nofly_overpass_source_ready = bool(source_status.get("nofly_overpass_source_ready", False))
-    custom_nofly_source_ready = bool(source_status.get("custom_nofly_source_ready", False))
-    existing_route_source_ready = bool(source_status.get("existing_route_source_ready", False))
-
-    line_overlap_m = _line_overlap_m(high_road_lines_xy + hsr_lines_xy + hv_power_lines_xy)
-    layer_status_catalog: Dict[str, Dict[str, str]] = {
-        _normalize_layer_key("人口密度"): _compose_layer_status(
-            population_source_ready,
-            population_support > 0.05,
-            population_score,
-            population_support,
-            "请检查 population 输出是否存在。",
-        ),
-        _normalize_layer_key("自定义禁飞区（用户）"): _compose_layer_status(
-            custom_nofly_source_ready,
-            _count_geom_hits(custom_no_fly_polys_xy, max_scan=1200) > 0,
-            nofly_score,
-            min(1.0, _count_geom_hits(custom_no_fly_polys_xy, max_scan=1200) / 4.0),
-            "本次未提供自定义禁飞区文件。",
-        ),
-        _normalize_layer_key("民航机场禁飞区（CAAC）"): _compose_layer_status(
-            civil_airport_source_ready,
-            _count_geom_hits(civil_airport_polys_xy, max_scan=500) > 0,
-            nofly_score,
-            nofly_support,
-            "请检查 CAAC 禁飞区数据集是否可用。",
-        ),
-        _normalize_layer_key("军用机场禁飞区（硬约束）"): _compose_layer_status(
-            nofly_overpass_source_ready,
-            _count_geom_hits(military_hard_nofly_polys_xy, max_scan=400) > 0,
-            nofly_score,
-            nofly_support,
-            "本次未成功获取 Overpass 军用机场数据。",
-        ),
-        _normalize_layer_key("直升机场避让区（软约束）"): _compose_layer_status(
-            nofly_overpass_source_ready,
-            _count_geom_hits(heli_soft_nofly_polys_xy, max_scan=500) > 0,
-            nofly_score,
-            nofly_support,
-            "本次未成功获取 Overpass 直升机场数据。",
-        ),
-        _normalize_layer_key("已有航线中心线"): _compose_layer_status(
-            existing_route_source_ready,
-            _count_geom_hits(existing_route_corridors_xy, max_scan=EXISTING_ROUTE_LAYER_MAX_ITEMS) > 0,
-            nofly_score,
-            min(1.0, len(existing_route_lines_xy) / 6.0),
-            "本次未提供已有航线目录，或目录内无有效 KML 线要素。",
-        ),
-        _normalize_layer_key(
-            f"已有航线避让区（水平±{int(round(existing_route_horizontal_buffer_m))}m/垂直±{int(round(existing_route_vertical_buffer_m))}m）"
-        ): _compose_layer_status(
-            existing_route_source_ready,
-            _count_geom_hits(existing_route_corridors_xy, max_scan=EXISTING_ROUTE_LAYER_MAX_ITEMS) > 0,
-            nofly_score,
-            min(1.0, len(existing_route_corridors_xy) / 6.0),
-            "本次未提供已有航线目录，或目录内无有效 KML 线要素。",
-        ),
-        _normalize_layer_key(f"起降点放松区（已有航线约束 {int(round(existing_route_endpoint_relief_m))}m）"): _compose_layer_status(
-            existing_route_source_ready,
-            existing_route_relief_union_xy is not None and (not existing_route_relief_union_xy.is_empty),
-            nofly_score,
-            1.0 if existing_route_relief_union_xy is not None and (not existing_route_relief_union_xy.is_empty) else 0.0,
-            "未启用已有航线约束放松区。",
-        ),
-        _normalize_layer_key("土地利用"): _compose_layer_status(
-            landuse_source_ready,
-            _count_geom_hits(landuse_geoms_xy, max_scan=2200) > 0,
-            landuse_score,
-            landuse_support,
-            "请检查 landuse 输出是否存在。",
-        ),
-        _normalize_layer_key("全部建筑物"): _compose_layer_status(
-            building_source_ready,
-            _count_geom_hits(all_building_polys_xy, max_scan=3000) > 0,
-            building_score,
-            building_support,
-            "本次未成功获取 OSM 建筑数据。",
-        ),
-        _normalize_layer_key(f"高层建筑（>={int(HIGH_BUILDING_THRESHOLD_M)}m）"): _compose_layer_status(
-            building_source_ready,
-            _count_geom_hits(high_building_polys_xy, max_scan=1200) > 0,
-            building_score,
-            building_support,
-            "本次未成功获取 OSM 建筑数据。",
-        ),
-        _normalize_layer_key("学校/幼儿园避让区"): _compose_layer_status(
-            school_source_ready,
-            max(
-                _count_geom_hits(school_hard_zones_xy, max_scan=1200),
-                _count_geom_hits(school_points_xy, max_scan=1200),
-            )
-            > 0,
-            nofly_score,
-            nofly_support,
-            "本次未成功获取 Overpass 学校/幼儿园数据。",
-        ),
-        _normalize_layer_key("人群聚集 POI"): _compose_layer_status(
-            poi_source_ready,
-            _count_geom_hits(crowd_points_xy, max_scan=2200) > 0,
-            poi_score,
-            poi_support,
-            "请检查 POI 输出是否存在。",
-        ),
-        _normalize_layer_key("敏感设施 POI"): _compose_layer_status(
-            poi_source_ready,
-            _count_geom_hits(key_points_xy, max_scan=2200) > 0,
-            poi_score,
-            poi_support,
-            "请检查 POI 输出是否存在。",
-        ),
-        _normalize_layer_key("关键基础设施"): _compose_layer_status(
-            poi_source_ready,
-            _count_geom_hits(infra_geoms_xy, max_scan=1200) > 0,
-            nofly_score,
-            nofly_support,
-            "请检查基础设施来源数据是否可用。",
-        ),
-        _normalize_layer_key("线性风险（高速/高铁/高压电力线）"): _compose_layer_status(
-            transport_source_ready,
-            line_overlap_m > 8.0,
-            transport_score,
-            transport_support,
-            "请检查 transport/hydro 输出是否存在。",
-        ),
-    }
-
     folium.LayerControl(collapsed=False).add_to(m)
     html_text = m.get_root().render()
     if "</head>" in html_text:
@@ -9356,7 +7091,6 @@ def write_preview_html(
                 name=name,
                 route_variants=route_variants_for_editor,
                 default_route_variant_id=default_variant_id,
-                layer_status_catalog=layer_status_catalog,
             )
             + "\n</html>",
         )
@@ -9486,35 +7220,6 @@ def main() -> None:
         default=str(DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON),
         help="Civil airport no-fly dataset (GeoJSON converted from CAAC XLS).",
     )
-    parser.add_argument(
-        "--custom-no-fly-kml",
-        action="append",
-        default=[],
-        help="Optional custom no-fly KML path. Repeat this option to load multiple files.",
-    )
-    parser.add_argument(
-        "--existing-routes-dir",
-        default="",
-        help="Optional directory of existing route KML files to enforce 3D hard avoidance.",
-    )
-    parser.add_argument(
-        "--existing-route-horizontal-buffer-m",
-        type=float,
-        default=EXISTING_ROUTE_HORIZONTAL_BUFFER_M,
-        help="3D avoidance horizontal half-width around each existing route centerline (meters).",
-    )
-    parser.add_argument(
-        "--existing-route-vertical-buffer-m",
-        type=float,
-        default=EXISTING_ROUTE_VERTICAL_BUFFER_M,
-        help="3D avoidance vertical half-width around each existing route centerline (meters).",
-    )
-    parser.add_argument(
-        "--existing-route-endpoint-relief-m",
-        type=float,
-        default=EXISTING_ROUTE_ENDPOINT_RELIEF_M,
-        help="Relax existing-route 3D avoidance inside this radius around start/end points (meters).",
-    )
     parser.add_argument("--soft-no-fly-scale", type=float, default=1.0, help="Scale factor for soft no-fly penalty.")
     parser.add_argument(
         "--infra-hard-buffer-m",
@@ -9580,60 +7285,6 @@ def main() -> None:
         type=float,
         default=120.0,
         help="Minimum interior turn angle for final horizontal route (acute turns below this are forbidden).",
-    )
-    parser.add_argument(
-        "--emergency-enable",
-        dest="emergency_enable",
-        action="store_true",
-        default=True,
-        help="Enable emergency branch route planning (main-route forks to emergency landing spots).",
-    )
-    parser.add_argument(
-        "--no-emergency-enable",
-        dest="emergency_enable",
-        action="store_false",
-        help="Disable emergency branch route planning.",
-    )
-    parser.add_argument(
-        "--emergency-segment-km",
-        type=float,
-        default=EMERGENCY_ROUTE_SEGMENT_LEN_M / 1000.0,
-        help="Coverage rule: at least one emergency branch per this route segment length (km).",
-    )
-    parser.add_argument(
-        "--emergency-max-branch-m",
-        type=float,
-        default=EMERGENCY_ROUTE_MAX_BRANCH_M,
-        help="Max branch length from fork point to emergency landing spot (m).",
-    )
-    parser.add_argument(
-        "--emergency-search-radius-m",
-        type=float,
-        default=EMERGENCY_ROUTE_SEARCH_RADIUS_M,
-        help="Search radius around fork point for emergency landing candidates (m).",
-    )
-    parser.add_argument(
-        "--emergency-min-spacing-km",
-        type=float,
-        default=EMERGENCY_ROUTE_MIN_SPACING_M / 1000.0,
-        help="Minimum spacing between emergency branches along main route (km).",
-    )
-    parser.add_argument(
-        "--emergency-min-fork-angle-deg",
-        type=float,
-        default=EMERGENCY_ROUTE_MIN_FORK_INTERIOR_ANGLE_DEG,
-        help="Minimum interior angle (deg) between main-route incoming segment and emergency branch at fork.",
-    )
-    parser.add_argument(
-        "--emergency-terminal-max-true-height-m",
-        type=float,
-        default=EMERGENCY_ROUTE_TERMINAL_MAX_TRUE_HEIGHT_M,
-        help="Maximum true height when reaching directly above emergency landing point (m).",
-    )
-    parser.add_argument(
-        "--emergency-strict",
-        action="store_true",
-        help="Fail run if emergency branch coverage does not satisfy all segments.",
     )
     parser.add_argument(
         "--vertical-tradeoff",
@@ -9707,9 +7358,6 @@ def main() -> None:
     )
     args = parser.parse_args()
     effective_clearance_m = max(30.0, float(args.clearance_m))
-    existing_route_horizontal_buffer_m = max(0.0, float(args.existing_route_horizontal_buffer_m))
-    existing_route_vertical_buffer_m = max(0.0, float(args.existing_route_vertical_buffer_m))
-    existing_route_endpoint_relief_m = max(0.0, float(args.existing_route_endpoint_relief_m))
 
     root = Path(__file__).resolve().parents[3]
     reference_points_wgs: List[Tuple[float, float]] = []
@@ -9729,16 +7377,6 @@ def main() -> None:
         if len(reference_points_wgs) < 2:
             raise ValueError("--reference-kml must contain at least two coordinates.")
 
-    existing_routes_wgs: List[Dict[str, Any]] = []
-    existing_routes_load_stats: Dict[str, Any] = {
-        "directory": "",
-        "files_total": 0,
-        "loaded_files": 0,
-        "failed_files": [],
-    }
-    if args.existing_routes_dir:
-        existing_routes_wgs, existing_routes_load_stats = load_existing_route_kmls_from_dir(Path(args.existing_routes_dir))
-
     ensure_city_data(root, args.city, args.city_zoom)
     cache_dir = _find_city_cache_dir(root, args.city)
     if cache_dir is None:
@@ -9749,29 +7387,9 @@ def main() -> None:
     summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
     projector_points = [start_wgs, end_wgs] + reference_points_wgs
-    for route in existing_routes_wgs:
-        points = route.get("points_wgs_alt") or []
-        if not points:
-            continue
-        lon0, lat0, _ = points[0]
-        projector_points.append((float(lon0), float(lat0)))
-        lon1, lat1, _ = points[-1]
-        projector_points.append((float(lon1), float(lat1)))
     fwd, inv = build_projectors(projector_points)
     start_xy = wgs_to_xy(fwd, start_wgs[0], start_wgs[1])
     end_xy = wgs_to_xy(fwd, end_wgs[0], end_wgs[1])
-    existing_route_index = build_existing_route_3d_index(
-        existing_routes_wgs,
-        fwd=fwd,
-        horizontal_buffer_m=existing_route_horizontal_buffer_m,
-    )
-    existing_route_lines_xy: List[Any] = list(existing_route_index.get("line_geoms") or [])
-    existing_route_corridors_xy: List[Any] = list(existing_route_index.get("corridor_geoms") or [])
-    existing_route_relief_union_xy = None
-    if existing_route_endpoint_relief_m > 0.0:
-        existing_route_relief_union_xy = Point(start_xy).buffer(existing_route_endpoint_relief_m).union(
-            Point(end_xy).buffer(existing_route_endpoint_relief_m)
-        )
     bbox_points = reference_points_wgs if len(reference_points_wgs) >= 2 else [start_wgs, end_wgs]
     route_bbox = route_bbox_wgs(bbox_points, margin_m=4500.0)
     route_bbox_building = route_bbox_wgs(bbox_points, margin_m=2800.0)
@@ -9818,23 +7436,14 @@ def main() -> None:
             pass
         if school_hard_union_xy.is_empty:
             school_hard_union_xy = None
-    school_route_avoid_union_xy = None
-    if school_hard_union_xy is not None and (not school_hard_union_xy.is_empty):
-        try:
-            school_route_avoid_union_xy = school_hard_union_xy.buffer(float(ROUTE_BUFFER_M))
-        except Exception:
-            school_route_avoid_union_xy = school_hard_union_xy
 
     nofly_hard_polys_xy: List[Any] = []
     nofly_soft_polys_xy: List[Any] = []
     nofly_military_hard_polys_xy: List[Any] = []
     nofly_heli_soft_polys_xy: List[Any] = []
-    custom_nofly_polys_xy: List[Any] = []
-    custom_nofly_files_abs: List[str] = []
-    custom_nofly_sources: List[Dict[str, Any]] = []
     civil_airport_route_scope_polys_xy: List[Any] = []
     civil_airport_display_polys_xy: List[Any] = []
-    nofly_counter: Dict[str, Any] = {"civil_airport": 0, "military_airport": 0, "hard": 0, "soft": 0, "overpass_query_ok": False}
+    nofly_counter: Dict[str, Any] = {"civil_airport": 0, "military_airport": 0, "hard": 0, "soft": 0}
     city_bbox_info = summary.get("bbox", {}) if isinstance(summary.get("bbox", {}), dict) else {}
     city_bbox = (
         _safe_float(city_bbox_info.get("south", route_bbox[0])),
@@ -9842,15 +7451,6 @@ def main() -> None:
         _safe_float(city_bbox_info.get("west", route_bbox[2])),
         _safe_float(city_bbox_info.get("east", route_bbox[3])),
     )
-    for raw_path in args.custom_no_fly_kml:
-        path_candidate = Path(str(raw_path)).expanduser().resolve()
-        if not path_candidate.exists():
-            raise FileNotFoundError(f"Custom no-fly KML not found: {path_candidate}")
-        custom_polys_xy, custom_stats = load_custom_no_fly_polygons_from_kml(path_candidate, fwd)
-        custom_nofly_polys_xy.extend(custom_polys_xy)
-        custom_nofly_files_abs.append(str(path_candidate))
-        custom_stats["loaded_polygons"] = int(len(custom_polys_xy))
-        custom_nofly_sources.append(custom_stats)
     if args.open_data_no_fly:
         nofly_hard_polys_xy, nofly_soft_polys_xy, nofly_counter, civil_airport_route_scope_polys_xy, nofly_military_hard_polys_xy, nofly_heli_soft_polys_xy = fetch_open_data_no_fly_zones(
             route_bbox,
@@ -9876,20 +7476,13 @@ def main() -> None:
             civil_airport_display_polys_xy = list(civil_airport_route_scope_polys_xy)
         nofly_counter["civil_dataset_city_scope"] = civil_city_stats
         nofly_counter["civil_dataset_city_match"] = civil_city_match_stats
-    if custom_nofly_polys_xy:
-        nofly_hard_polys_xy.extend(custom_nofly_polys_xy)
-    nofly_counter["custom_user"] = int(len(custom_nofly_polys_xy))
-    nofly_counter["custom_user_files"] = int(len(custom_nofly_files_abs))
-    nofly_counter["custom_user_sources"] = custom_nofly_sources
-    nofly_counter["hard"] = int(len(nofly_hard_polys_xy))
-    nofly_counter["soft"] = int(len(nofly_soft_polys_xy))
     nofly_hard_union_xy = unary_union(nofly_hard_polys_xy) if nofly_hard_polys_xy else None
     nofly_soft_union_xy = unary_union(nofly_soft_polys_xy) if nofly_soft_polys_xy else None
     if nofly_hard_union_xy is not None and (not nofly_hard_union_xy.is_empty):
         if Point(start_xy).intersects(nofly_hard_union_xy):
-            raise RuntimeError("Start point is inside hard no-fly zone (open-data/custom). Please move OD or adjust no-fly inputs.")
+            raise RuntimeError("Start point is inside open-data no-fly zone. Please move OD or disable --open-data-no-fly.")
         if Point(end_xy).intersects(nofly_hard_union_xy):
-            raise RuntimeError("End point is inside hard no-fly zone (open-data/custom). Please move OD or adjust no-fly inputs.")
+            raise RuntimeError("End point is inside open-data no-fly zone. Please move OD or disable --open-data-no-fly.")
 
     b_geoms, b_heights, o_geoms, o_heights, obstacle_counter = fetch_osm_buildings_and_obstacles(route_bbox_building, fwd)
     b_tree = STRtree(b_geoms) if b_geoms else None
@@ -10021,7 +7614,7 @@ def main() -> None:
                 local_infra_hard_union_xy = safety_infra_hard_union_xy
             else:
                 local_infra_hard_union_xy = unary_union([local_infra_hard_union_xy, safety_infra_hard_union_xy])
-        local_crowd_hard_union_xy = school_route_avoid_union_xy
+        local_crowd_hard_union_xy = school_hard_union_xy
         if local_sensitive_hard_union_xy is not None:
             if local_crowd_hard_union_xy is None:
                 local_crowd_hard_union_xy = local_sensitive_hard_union_xy
@@ -10065,7 +7658,7 @@ def main() -> None:
             crowd_points_xy=crowd_points_xy,
             crowd_tree=crowd_tree,
             crowd_id_map=crowd_id_map,
-            school_hard_union_xy=school_route_avoid_union_xy,
+            school_hard_union_xy=school_hard_union_xy,
             sensitive_hard_union_xy=local_sensitive_hard_union_xy,
             school_penalty_air=float(school_penalty_air),
             school_penalty_ground=float(school_penalty_ground),
@@ -10178,72 +7771,7 @@ def main() -> None:
         )
         if _turn_angle_ok(cand):
             nodes = cand
-        cand = regularize_parallel_bridge_segments(
-            nodes,
-            min_turn_angle_deg=min_turn_angle_deg,
-            pop_sampler=pop_sampler,
-            inv=inv,
-            no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=local_infra_hard_union_xy,
-            crowd_hard_union_xy=local_crowd_hard_union_xy,
-            passes=2,
-        )
-        cand = enforce_min_turn_angle(
-            cand,
-            min_turn_angle_deg=min_turn_angle_deg,
-            pop_sampler=pop_sampler,
-            inv=inv,
-            no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=local_infra_hard_union_xy,
-            crowd_hard_union_xy=local_crowd_hard_union_xy,
-            passes=3,
-        )
-        if _turn_angle_ok(cand):
-            nodes = cand
-        cand = regularize_short_residual_segments(
-            nodes,
-            min_turn_angle_deg=min_turn_angle_deg,
-            pop_sampler=pop_sampler,
-            inv=inv,
-            no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=local_infra_hard_union_xy,
-            crowd_hard_union_xy=local_crowd_hard_union_xy,
-            passes=3,
-        )
-        cand = enforce_min_turn_angle(
-            cand,
-            min_turn_angle_deg=min_turn_angle_deg,
-            pop_sampler=pop_sampler,
-            inv=inv,
-            no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=local_infra_hard_union_xy,
-            crowd_hard_union_xy=local_crowd_hard_union_xy,
-            passes=2,
-        )
-        if _turn_angle_ok(cand):
-            nodes = cand
         cand = simplify_polyline(nodes, tol_m=20.0)
-        if _turn_angle_ok(cand):
-            nodes = cand
-        cand = compress_collinear_short_runs(
-            nodes,
-            pop_sampler=pop_sampler,
-            inv=inv,
-            no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=local_infra_hard_union_xy,
-            crowd_hard_union_xy=local_crowd_hard_union_xy,
-            passes=3,
-        )
-        cand = enforce_min_turn_angle(
-            cand,
-            min_turn_angle_deg=min_turn_angle_deg,
-            pop_sampler=pop_sampler,
-            inv=inv,
-            no_fly_hard_union_xy=nofly_hard_union_xy,
-            infra_hard_union_xy=local_infra_hard_union_xy,
-            crowd_hard_union_xy=local_crowd_hard_union_xy,
-            passes=2,
-        )
         if _turn_angle_ok(cand):
             nodes = cand
         if int(args.max_waypoints) > 2:
@@ -10276,12 +7804,6 @@ def main() -> None:
         min_turn_angle_local = polyline_min_interior_angle(nodes)
         route_line_local = LineString(nodes)
         route_buffer_local = route_line_local.buffer(ROUTE_BUFFER_M)
-        if school_hard_union_xy is not None and (not school_hard_union_xy.is_empty):
-            try:
-                if route_buffer_local.intersects(school_hard_union_xy):
-                    return None
-            except Exception:
-                return None
         crowd_in_buf_local = _count_geoms_intersecting(crowd_tree, route_buffer_local, crowd_points_xy, crowd_id_map)
         key_in_buf_local = _count_geoms_intersecting(key_tree, route_buffer_local, key_points_xy, key_id_map)
         infra_in_buf_local = _count_geoms_intersecting(infra_tree, route_buffer_local, infra_geoms, infra_id_map)
@@ -10319,7 +7841,6 @@ def main() -> None:
             "min_turn_angle_deg": round(float(min_turn_angle_local), 2),
             "buffer_metrics": {
                 "crowd_points_in_buffer": int(crowd_in_buf_local),
-                "school_hard_overlap": False,
                 "sensitive_facility_points_in_buffer": int(key_in_buf_local),
                 "key_facility_points_in_buffer": int(key_in_buf_local),
                 "critical_infra_geoms_in_buffer": int(infra_in_buf_local),
@@ -10458,43 +7979,10 @@ def main() -> None:
                 min_true_height_m=float(args.min_true_height_m),
                 max_true_height_m=float(args.max_true_height_m),
                 endpoint_true_height_m=float(args.endpoint_true_height_m),
-                existing_route_index=existing_route_index,
-                existing_route_horizontal_buffer_m=float(existing_route_horizontal_buffer_m),
-                existing_route_vertical_buffer_m=float(existing_route_vertical_buffer_m),
-                existing_route_relief_union_xy=existing_route_relief_union_xy,
             )
         except Exception as exc:
             candidate_failures.append({"id": cand.get("id", "unknown"), "error": f"altitude_infeasible: {exc}"})
             continue
-        existing_conflicts = check_existing_route_3d_conflicts(
-            cand_profile,
-            fwd=fwd,
-            existing_route_index=existing_route_index,
-            horizontal_buffer_m=float(existing_route_horizontal_buffer_m),
-            vertical_buffer_m=float(existing_route_vertical_buffer_m),
-            relief_union_xy=existing_route_relief_union_xy,
-            max_records=10,
-        )
-        cand["existing_route_3d_conflicts"] = existing_conflicts
-        if int(existing_conflicts.get("conflict_samples", 0)) > 0:
-            candidate_failures.append(
-                {
-                    "id": cand.get("id", "unknown"),
-                    "error": (
-                        f"existing_route_3d_conflict: conflict_samples={int(existing_conflicts.get('conflict_samples', 0))}, "
-                        f"horizontal<= {existing_route_horizontal_buffer_m:.1f}m and vertical<= {existing_route_vertical_buffer_m:.1f}m"
-                    ),
-                    "records": existing_conflicts.get("records", []),
-                }
-            )
-            continue
-        cand["existing_route_profile_markers"] = build_existing_route_profile_markers(
-            cand_profile,
-            fwd=fwd,
-            existing_route_index=existing_route_index,
-            horizontal_focus_m=float(existing_route_horizontal_buffer_m),
-            relief_union_xy=existing_route_relief_union_xy,
-        )
         cand["altitude_points_wgs_alt"] = pts_wgs_alt
         cand["altitude_meta"] = cand_alt_meta
         cand["altitude_profile_samples"] = cand_profile
@@ -10502,7 +7990,6 @@ def main() -> None:
         cand["total_climb_m"] = float(cand_alt_meta.get("total_climb_m", 0.0))
         cand["total_descent_m"] = float(cand_alt_meta.get("total_descent_m", 0.0))
         cand["max_true_height_m"] = float(cand_alt_meta.get("max_true_height_m", 0.0))
-        cand["buffer_metrics"]["existing_route_3d_conflict_samples"] = int(cand.get("existing_route_3d_conflicts", {}).get("conflict_samples", 0))
         altitude_ok_results.append(cand)
     candidate_results = altitude_ok_results
     if not candidate_results:
@@ -10659,7 +8146,6 @@ def main() -> None:
     infra_in_buffer = int(selected_candidate["buffer_metrics"]["critical_infra_geoms_in_buffer"])
     line_overlap_m = float(selected_candidate["buffer_metrics"]["line_risk_overlap_m"])
     high_build_overlap_m = float(selected_candidate["buffer_metrics"]["high_building_overlap_m"])
-    existing_route_conflict_samples = int(selected_candidate["buffer_metrics"].get("existing_route_3d_conflict_samples", 0))
     points_wgs_alt = selected_candidate["altitude_points_wgs_alt"]
     alt_meta = selected_candidate["altitude_meta"]
     profile_samples = selected_candidate["altitude_profile_samples"]
@@ -10676,767 +8162,6 @@ def main() -> None:
     evidence_out = out_dir / f"{base_name}_evidence.json"
     snapshot_root = Path(args.snapshot_dir).resolve() if args.snapshot_dir else (out_dir / "snapshots").resolve()
     snapshot_out = snapshot_root / f"{base_name}_snapshot.json"
-    emergency_kml_out = out_dir / f"{base_name}_emergency_branches.kml"
-    emergency_routes_for_html: List[Dict[str, Any]] = []
-    emergency_routes_for_kml: List[Dict[str, Any]] = []
-    emergency_routes_summary: List[Dict[str, Any]] = []
-    emergency_uncovered_segments: List[Dict[str, Any]] = []
-    emergency_landing_source_counter: Dict[str, int] = {}
-    emergency_attempt_stats: Dict[str, Any] = {
-        "anchor_attempts": 0,
-        "candidate_attempts": 0,
-        "rejected_by_length": 0,
-        "rejected_by_fork_angle": 0,
-        "rejected_by_hard_constraints": 0,
-        "rejected_by_altitude": 0,
-        "rejected_by_landing_overhead_true_height": 0,
-        "rejected_by_descent_distance": 0,
-        "rejected_no_candidate": 0,
-    }
-    emergency_segment_len_m = max(300.0, float(args.emergency_segment_km) * 1000.0)
-    emergency_spacing_max_m = float(emergency_segment_len_m)
-    emergency_spacing_min_req_m = max(120.0, float(args.emergency_min_spacing_km) * 1000.0)
-    emergency_max_branch_m = max(80.0, float(args.emergency_max_branch_m))
-    emergency_search_radius_m = max(emergency_max_branch_m, float(args.emergency_search_radius_m))
-    emergency_min_fork_angle_deg = max(60.0, min(179.0, float(args.emergency_min_fork_angle_deg)))
-    emergency_terminal_max_true_height_m = max(0.0, float(args.emergency_terminal_max_true_height_m))
-    emergency_segment_count = max(1, int(math.ceil(max(1e-6, float(route_line_xy.length)) / emergency_segment_len_m)))
-    emergency_plan_enabled = bool(args.emergency_enable)
-
-    emergency_hard_infra_union_xy = safety_infra_hard_union_xy
-    if emergency_hard_infra_union_xy is None:
-        emergency_hard_infra_union_xy = legacy_infra_hard_union_xy
-    emergency_crowd_hard_union_xy = school_route_avoid_union_xy
-    if sensitive_hard_union_xy is not None:
-        emergency_crowd_hard_union_xy = (
-            sensitive_hard_union_xy
-            if emergency_crowd_hard_union_xy is None
-            else unary_union([emergency_crowd_hard_union_xy, sensitive_hard_union_xy])
-        )
-
-    emergency_spacing_min_used_m = emergency_spacing_min_req_m
-    emergency_gap_checks: List[Dict[str, Any]] = []
-    if emergency_plan_enabled:
-        (
-            emergency_landing_geoms_xy,
-            emergency_landing_labels,
-            emergency_landing_base_risks,
-            emergency_landing_source_counter,
-        ) = load_emergency_landing_polygons(summary, fwd)
-        emergency_landing_tree = STRtree(emergency_landing_geoms_xy) if emergency_landing_geoms_xy else None
-        emergency_landing_id_map = _build_geom_id_map(emergency_landing_geoms_xy) if emergency_landing_geoms_xy else {}
-        emergency_infra_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
-        emergency_crowd_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
-        emergency_key_nearest_cache: Dict[Tuple[float, float], Tuple[Optional[int], float]] = {}
-        emergency_rooftop_points_xy: List[Any] = []
-        rooftop_seen = set()
-        for geom, h in zip(b_geoms, b_heights):
-            if geom is None or geom.is_empty:
-                continue
-            hh = _safe_float(h, 0.0)
-            if hh < 10.0 or hh > HIGH_BUILDING_THRESHOLD_M:
-                continue
-            try:
-                pt = geom.representative_point()
-            except Exception:
-                continue
-            if pt is None or pt.is_empty:
-                continue
-            key = _round_key((float(pt.x), float(pt.y)), snap_m=10.0)
-            if key in rooftop_seen:
-                continue
-            if nofly_hard_union_xy is not None and pt.intersects(nofly_hard_union_xy):
-                continue
-            if emergency_hard_infra_union_xy is not None and pt.intersects(emergency_hard_infra_union_xy):
-                continue
-            if emergency_crowd_hard_union_xy is not None and pt.intersects(emergency_crowd_hard_union_xy):
-                continue
-            if school_hard_union_xy is not None and (not school_hard_union_xy.is_empty) and pt.intersects(school_hard_union_xy):
-                continue
-            try:
-                if line_risk_union_xy is not None and (not line_risk_union_xy.is_empty) and pt.buffer(12.0).intersects(line_risk_union_xy):
-                    continue
-            except Exception:
-                continue
-            rooftop_seen.add(key)
-            emergency_rooftop_points_xy.append(Point(float(pt.x), float(pt.y)))
-        emergency_rooftop_tree = STRtree(emergency_rooftop_points_xy) if emergency_rooftop_points_xy else None
-        emergency_rooftop_id_map = _build_geom_id_map(emergency_rooftop_points_xy) if emergency_rooftop_points_xy else {}
-        emergency_landing_source_counter["建筑楼顶（低风险）"] = int(len(emergency_rooftop_points_xy))
-
-        def _collect_emergency_landing_candidates(anchor_xy: Tuple[float, float]) -> List[Dict[str, Any]]:
-            if emergency_landing_tree is None or not emergency_landing_geoms_xy:
-                out: List[Dict[str, Any]] = []
-            else:
-                out = []
-            anchor_pt = Point(anchor_xy)
-            search_geom = anchor_pt.buffer(float(emergency_search_radius_m))
-            cands = (
-                _tree_candidate_indices(
-                    emergency_landing_tree,
-                    search_geom,
-                    emergency_landing_geoms_xy,
-                    emergency_landing_id_map,
-                )
-                if emergency_landing_tree is not None and emergency_landing_geoms_xy
-                else []
-            )
-            dedupe = set()
-            for idx in cands:
-                if idx < 0 or idx >= len(emergency_landing_geoms_xy):
-                    continue
-                zone = emergency_landing_geoms_xy[idx]
-                if zone is None or zone.is_empty:
-                    continue
-                try:
-                    if not zone.intersects(search_geom):
-                        continue
-                    nearest = nearest_points(anchor_pt, zone)[1]
-                except Exception:
-                    continue
-                if nearest is None:
-                    continue
-                landing_xy = (float(nearest.x), float(nearest.y))
-                key = _round_key(landing_xy, snap_m=20.0)
-                if key in dedupe:
-                    continue
-                dedupe.add(key)
-                dist_m = float(anchor_pt.distance(nearest))
-                if dist_m > emergency_search_radius_m + 1e-6:
-                    continue
-                if nofly_hard_union_xy is not None and nearest.intersects(nofly_hard_union_xy):
-                    continue
-                if emergency_hard_infra_union_xy is not None and nearest.intersects(emergency_hard_infra_union_xy):
-                    continue
-                if emergency_crowd_hard_union_xy is not None and nearest.intersects(emergency_crowd_hard_union_xy):
-                    continue
-                lon, lat = xy_to_wgs(inv, landing_xy[0], landing_xy[1])
-                pop_val = pop_sampler.sample(lon, lat)
-                infra_pen = infrastructure_penalty_at_point(
-                    landing_xy,
-                    infra_geoms,
-                    infra_severities,
-                    infra_tree,
-                    infra_id_map,
-                    point_geom=nearest,
-                    nearest_cache=emergency_infra_nearest_cache,
-                )
-                crowd_pen = point_risk_penalty_at_point(
-                    landing_xy,
-                    crowd_points_xy,
-                    crowd_tree,
-                    crowd_id_map,
-                    inner_m=50.0,
-                    point_geom=nearest,
-                    nearest_cache=emergency_crowd_nearest_cache,
-                )
-                key_pen = point_risk_penalty_at_point(
-                    landing_xy,
-                    key_points_xy,
-                    key_tree,
-                    key_id_map,
-                    inner_m=70.0,
-                    point_geom=nearest,
-                    nearest_cache=emergency_key_nearest_cache,
-                )
-                line_pen = 0.0
-                high_build_pen = 0.0
-                try:
-                    if line_risk_union_xy is not None and (not line_risk_union_xy.is_empty):
-                        line_pen = 1.0 if nearest.buffer(20.0).intersects(line_risk_union_xy) else 0.0
-                except Exception:
-                    line_pen = 0.0
-                try:
-                    if high_building_union_xy is not None and (not high_building_union_xy.is_empty):
-                        high_build_pen = 1.0 if nearest.buffer(25.0).intersects(high_building_union_xy) else 0.0
-                except Exception:
-                    high_build_pen = 0.0
-                base_risk = float(emergency_landing_base_risks[idx]) if idx < len(emergency_landing_base_risks) else 0.35
-                score = (
-                    0.95 * min(2.0, dist_m / max(1.0, emergency_max_branch_m))
-                    + 1.0 * min(3.5, pop_val / 1200.0)
-                    + 0.85 * crowd_pen
-                    + 0.9 * key_pen
-                    + 0.95 * infra_pen
-                    + 0.8 * line_pen
-                    + 0.65 * high_build_pen
-                    + 1.15 * base_risk
-                )
-                out.append(
-                    {
-                        "landing_xy": landing_xy,
-                        "distance_m": round(dist_m, 2),
-                        "landing_type_label": emergency_landing_labels[idx] if idx < len(emergency_landing_labels) else "应急备降点",
-                        "safety_score": round(float(score), 4),
-                        "population": round(float(pop_val), 2),
-                    }
-                )
-            if emergency_rooftop_tree is not None and emergency_rooftop_points_xy:
-                roof_cands = _tree_candidate_indices(
-                    emergency_rooftop_tree,
-                    search_geom,
-                    emergency_rooftop_points_xy,
-                    emergency_rooftop_id_map,
-                )
-                for idx in roof_cands:
-                    if idx < 0 or idx >= len(emergency_rooftop_points_xy):
-                        continue
-                    pt = emergency_rooftop_points_xy[idx]
-                    if pt is None or pt.is_empty:
-                        continue
-                    landing_xy = (float(pt.x), float(pt.y))
-                    key = _round_key(landing_xy, snap_m=20.0)
-                    if key in dedupe:
-                        continue
-                    dedupe.add(key)
-                    dist_m = float(anchor_pt.distance(pt))
-                    if dist_m > emergency_search_radius_m + 1e-6:
-                        continue
-                    lon, lat = xy_to_wgs(inv, landing_xy[0], landing_xy[1])
-                    pop_val = pop_sampler.sample(lon, lat)
-                    infra_pen = infrastructure_penalty_at_point(
-                        landing_xy,
-                        infra_geoms,
-                        infra_severities,
-                        infra_tree,
-                        infra_id_map,
-                        point_geom=pt,
-                        nearest_cache=emergency_infra_nearest_cache,
-                    )
-                    crowd_pen = point_risk_penalty_at_point(
-                        landing_xy,
-                        crowd_points_xy,
-                        crowd_tree,
-                        crowd_id_map,
-                        inner_m=50.0,
-                        point_geom=pt,
-                        nearest_cache=emergency_crowd_nearest_cache,
-                    )
-                    key_pen = point_risk_penalty_at_point(
-                        landing_xy,
-                        key_points_xy,
-                        key_tree,
-                        key_id_map,
-                        inner_m=70.0,
-                        point_geom=pt,
-                        nearest_cache=emergency_key_nearest_cache,
-                    )
-                    score = (
-                        0.95 * min(2.0, dist_m / max(1.0, emergency_max_branch_m))
-                        + 1.0 * min(3.5, pop_val / 1200.0)
-                        + 0.85 * crowd_pen
-                        + 0.9 * key_pen
-                        + 0.95 * infra_pen
-                        + 0.32
-                    )
-                    out.append(
-                        {
-                            "landing_xy": landing_xy,
-                            "distance_m": round(dist_m, 2),
-                            "landing_type_label": "建筑楼顶（低风险）",
-                            "safety_score": round(float(score), 4),
-                            "population": round(float(pop_val), 2),
-                        }
-                    )
-            out.sort(key=lambda x: (float(x.get("safety_score", 999.0)), float(x.get("distance_m", 9999.0))))
-            return out[: max(1, int(EMERGENCY_ROUTE_MAX_CANDIDATES_PER_ANCHOR))]
-
-        route_len_m = float(route_line_xy.length)
-        n_min_required = max(1, int(math.ceil(route_len_m / emergency_spacing_max_m)) - 1)
-        n_max_feasible = max(1, int(math.floor(route_len_m / max(1.0, emergency_spacing_min_req_m)) - 1))
-        target_route_count = n_min_required
-        emergency_spacing_min_used_m = min(
-            emergency_spacing_min_req_m,
-            max(0.0, route_len_m / max(1.0, float(target_route_count + 1)) - 1.0),
-        )
-        target_gap_m = route_len_m / max(1.0, float(target_route_count + 1))
-        target_distances_m = [target_gap_m * float(i + 1) for i in range(target_route_count)]
-        emergency_attempt_stats["target_routes"] = int(target_route_count)
-
-        main_profile_samples_sorted = sorted(
-            [s for s in (profile_samples or []) if isinstance(s, dict)],
-            key=lambda s: _safe_float(s.get("distance_m", 0.0), 0.0),
-        )
-
-        def _main_route_state_at(distance_m: float) -> Tuple[Optional[float], Optional[float]]:
-            if not main_profile_samples_sorted:
-                return None, None
-            target = float(distance_m)
-            best = min(
-                main_profile_samples_sorted,
-                key=lambda s: abs(_safe_float(s.get("distance_m", 0.0), 0.0) - target),
-            )
-            return (
-                _safe_float(best.get("route_alt_msl_m", 0.0), 0.0),
-                _safe_float(best.get("true_height_m", 0.0), 0.0),
-            )
-
-        def _polyline_len(points_xy: List[Tuple[float, float]]) -> float:
-            if len(points_xy) < 2:
-                return 0.0
-            total = 0.0
-            for i in range(1, len(points_xy)):
-                total += math.hypot(points_xy[i][0] - points_xy[i - 1][0], points_xy[i][1] - points_xy[i - 1][1])
-            return float(total)
-
-        def _detour_waypoint_offset(
-            d_m: float,
-            frac: float,
-            target_len_m: float,
-        ) -> Optional[float]:
-            if d_m <= 1e-6:
-                return None
-            a = max(1e-6, float(frac) * d_m)
-            b = max(1e-6, (1.0 - float(frac)) * d_m)
-            if target_len_m <= a + b + 1e-6:
-                return 0.0
-            lo = 0.0
-            hi = max(20.0, d_m)
-            for _ in range(20):
-                cur = math.hypot(a, hi) + math.hypot(b, hi)
-                if cur >= target_len_m:
-                    break
-                hi *= 1.35
-                if hi > 3000.0:
-                    break
-            if math.hypot(a, hi) + math.hypot(b, hi) < target_len_m - 1e-6:
-                return None
-            for _ in range(30):
-                mid = 0.5 * (lo + hi)
-                cur = math.hypot(a, mid) + math.hypot(b, mid)
-                if cur >= target_len_m:
-                    hi = mid
-                else:
-                    lo = mid
-            return float(hi)
-
-        def _build_multi_segment_candidates(
-            anchor_xy: Tuple[float, float],
-            landing_xy: Tuple[float, float],
-            desired_len_m: float,
-        ) -> List[List[Tuple[float, float]]]:
-            ax, ay = anchor_xy
-            lx, ly = landing_xy
-            dx = float(lx - ax)
-            dy = float(ly - ay)
-            d = math.hypot(dx, dy)
-            if d <= 1e-6:
-                return []
-            ux = dx / d
-            uy = dy / d
-            nx = -uy
-            ny = ux
-            target_len_m = min(float(emergency_max_branch_m), max(d, float(desired_len_m)))
-            raw: List[List[Tuple[float, float]]] = [[anchor_xy, landing_xy]]
-            if target_len_m > d + 5.0:
-                for frac in [0.4, 0.5, 0.6]:
-                    off = _detour_waypoint_offset(d_m=d, frac=frac, target_len_m=target_len_m)
-                    if off is None:
-                        continue
-                    base_x = ax + ux * frac * d
-                    base_y = ay + uy * frac * d
-                    for side in (-1.0, 1.0):
-                        wx = base_x + side * nx * off
-                        wy = base_y + side * ny * off
-                        raw.append([anchor_xy, (wx, wy), landing_xy])
-                for side in (-1.0, 1.0):
-                    frac1 = 0.33
-                    frac2 = 0.67
-                    off = _detour_waypoint_offset(d_m=d, frac=0.5, target_len_m=target_len_m)
-                    if off is None:
-                        continue
-                    amp = max(0.0, off * 0.72)
-                    p1 = (ax + ux * frac1 * d + side * nx * amp, ay + uy * frac1 * d + side * ny * amp)
-                    p2 = (ax + ux * frac2 * d + side * nx * amp, ay + uy * frac2 * d + side * ny * amp)
-                    raw.append([anchor_xy, p1, p2, landing_xy])
-            dedupe = set()
-            out: List[List[Tuple[float, float]]] = []
-            for pts in raw:
-                plen = _polyline_len(pts)
-                if plen <= 1e-6 or plen > emergency_max_branch_m + 1e-6:
-                    continue
-                key = tuple((round(float(p[0]), 1), round(float(p[1]), 1)) for p in pts)
-                if key in dedupe:
-                    continue
-                dedupe.add(key)
-                out.append(pts)
-            out.sort(key=lambda pts: abs(_polyline_len(pts) - target_len_m))
-            return out[:10]
-
-        def _build_emergency_candidate_for_anchor(
-            anchor_dist_m: float,
-            target_dist_m: float,
-        ) -> Optional[Dict[str, Any]]:
-            main_vec = _mainline_tangent_vector(route_line_xy, anchor_dist_m, delta_m=45.0)
-            if main_vec is None:
-                return None
-            try:
-                anchor_pt = route_line_xy.interpolate(anchor_dist_m)
-            except Exception:
-                return None
-            anchor_xy = (float(anchor_pt.x), float(anchor_pt.y))
-            candidates = _collect_emergency_landing_candidates(anchor_xy)
-            if not candidates:
-                emergency_attempt_stats["rejected_no_candidate"] = int(emergency_attempt_stats.get("rejected_no_candidate", 0) + 1)
-                return None
-            fork_route_alt_msl, fork_route_true_h = _main_route_state_at(anchor_dist_m)
-            if fork_route_alt_msl is None:
-                fork_route_alt_msl = None
-                fork_route_true_h = max(0.0, _safe_float(args.endpoint_true_height_m, 0.0))
-            best_item = None
-            best_obj = float("inf")
-            for cand in candidates:
-                emergency_attempt_stats["candidate_attempts"] = int(emergency_attempt_stats.get("candidate_attempts", 0) + 1)
-                landing_xy = cand["landing_xy"]
-                direct_len_m = float(math.hypot(landing_xy[0] - anchor_xy[0], landing_xy[1] - anchor_xy[1]))
-                descent_need_len_m = max(0.0, float(fork_route_true_h or 0.0) - float(emergency_terminal_max_true_height_m))
-                descent_need_len_m = descent_need_len_m * max(0.5, float(args.speed_ms)) / max(0.05, float(args.descend_ms))
-                desired_len_m = max(direct_len_m, descent_need_len_m * 1.05)
-                if desired_len_m > emergency_max_branch_m + 1e-6:
-                    emergency_attempt_stats["rejected_by_descent_distance"] = int(
-                        emergency_attempt_stats.get("rejected_by_descent_distance", 0) + 1
-                    )
-                    continue
-                path_candidates = _build_multi_segment_candidates(anchor_xy, landing_xy, desired_len_m=desired_len_m)
-                if not path_candidates:
-                    emergency_attempt_stats["rejected_by_length"] = int(emergency_attempt_stats.get("rejected_by_length", 0) + 1)
-                    continue
-                for path_nodes_xy in path_candidates:
-                    branch_line = LineString(path_nodes_xy)
-                    branch_buffer = branch_line.buffer(float(ROUTE_BUFFER_M))
-                    branch_len_m = float(branch_line.length)
-                    if branch_len_m > emergency_max_branch_m + 1e-6:
-                        emergency_attempt_stats["rejected_by_length"] = int(emergency_attempt_stats.get("rejected_by_length", 0) + 1)
-                        continue
-                    if len(path_nodes_xy) >= 3 and polyline_min_interior_angle(path_nodes_xy) + 1e-6 < float(args.min_turn_angle_deg):
-                        emergency_attempt_stats["rejected_by_fork_angle"] = int(emergency_attempt_stats.get("rejected_by_fork_angle", 0) + 1)
-                        continue
-                    first_leg_vec = (
-                        float(path_nodes_xy[1][0] - path_nodes_xy[0][0]),
-                        float(path_nodes_xy[1][1] - path_nodes_xy[0][1]),
-                    )
-                    deflection_deg = _vector_angle(main_vec, first_leg_vec)
-                    fork_interior_deg = 180.0 - deflection_deg
-                    if fork_interior_deg + 1e-6 < emergency_min_fork_angle_deg:
-                        emergency_attempt_stats["rejected_by_fork_angle"] = int(emergency_attempt_stats.get("rejected_by_fork_angle", 0) + 1)
-                        continue
-                    blocked = False
-                    if nofly_hard_union_xy is not None and branch_buffer.intersects(nofly_hard_union_xy):
-                        blocked = True
-                    if (not blocked) and emergency_hard_infra_union_xy is not None and branch_buffer.intersects(emergency_hard_infra_union_xy):
-                        blocked = True
-                    if (not blocked) and emergency_crowd_hard_union_xy is not None and branch_buffer.intersects(emergency_crowd_hard_union_xy):
-                        blocked = True
-                    if (not blocked) and school_hard_union_xy is not None and (not school_hard_union_xy.is_empty):
-                        try:
-                            if branch_buffer.intersects(school_hard_union_xy):
-                                blocked = True
-                        except Exception:
-                            blocked = True
-                    if blocked:
-                        emergency_attempt_stats["rejected_by_hard_constraints"] = int(
-                            emergency_attempt_stats.get("rejected_by_hard_constraints", 0) + 1
-                        )
-                        continue
-                    try:
-                        emergency_branch_min_true_m = min(float(args.min_true_height_m), float(emergency_terminal_max_true_height_m))
-                        emergency_branch_max_true_m = max(float(args.max_true_height_m), float(fork_route_true_h or 0.0) + 2.0)
-                        if emergency_branch_max_true_m + 1e-6 < emergency_branch_min_true_m:
-                            emergency_branch_max_true_m = emergency_branch_min_true_m
-                        branch_wgs_alt, branch_alt_meta, branch_profile_samples = plan_altitude_profile(
-                            path_nodes_xy,
-                            inv=inv,
-                            terrain_sampler=terrain_sampler,
-                            b_geoms=b_geoms,
-                            b_heights=b_heights,
-                            b_tree=b_tree,
-                            b_id_map=b_id_map,
-                            o_geoms=o_geoms,
-                            o_heights=o_heights,
-                            o_tree=o_tree,
-                            o_id_map=o_id_map,
-                            speed_ms=float(args.speed_ms),
-                            climb_ms=float(args.climb_ms),
-                            descend_ms=float(args.descend_ms),
-                            clearance_m=float(effective_clearance_m),
-                            preferred_cruise_max_m=float(args.preferred_cruise_max_m),
-                            hard_ceiling_m=float(args.hard_ceiling_m),
-                            min_true_height_m=float(emergency_branch_min_true_m),
-                            max_true_height_m=float(emergency_branch_max_true_m),
-                            endpoint_true_height_m=min(float(args.endpoint_true_height_m), float(emergency_terminal_max_true_height_m)),
-                            endpoint_start_msl_override=fork_route_alt_msl,
-                            endpoint_end_true_height_max_m=float(emergency_terminal_max_true_height_m),
-                        )
-                    except Exception:
-                        emergency_attempt_stats["rejected_by_altitude"] = int(emergency_attempt_stats.get("rejected_by_altitude", 0) + 1)
-                        continue
-                    landing_overhead_true_height_m = 0.0
-                    if branch_profile_samples:
-                        landing_sample = max(
-                            branch_profile_samples,
-                            key=lambda s: _safe_float(s.get("distance_m", 0.0), 0.0),
-                        )
-                        landing_overhead_true_height_m = _safe_float(
-                            landing_sample.get("true_height_m", 0.0),
-                            0.0,
-                        )
-                    if landing_overhead_true_height_m > emergency_terminal_max_true_height_m + 1e-6:
-                        emergency_attempt_stats["rejected_by_landing_overhead_true_height"] = int(
-                            emergency_attempt_stats.get("rejected_by_landing_overhead_true_height", 0) + 1
-                        )
-                        continue
-                    if branch_len_m + 1e-6 < descent_need_len_m:
-                        emergency_attempt_stats["rejected_by_descent_distance"] = int(
-                            emergency_attempt_stats.get("rejected_by_descent_distance", 0) + 1
-                        )
-                        continue
-                    fork_lon, fork_lat = xy_to_wgs(inv, anchor_xy[0], anchor_xy[1])
-                    landing_lon, landing_lat = xy_to_wgs(inv, landing_xy[0], landing_xy[1])
-                    dist_to_target_norm = abs(float(anchor_dist_m) - float(target_dist_m)) / max(1.0, target_gap_m)
-                    objective = (
-                        float(cand.get("safety_score", 0.0))
-                        + 0.85 * dist_to_target_norm
-                        + 0.20 * (branch_len_m / max(1.0, emergency_max_branch_m))
-                    )
-                    item = {
-                        "name": "",
-                        "segment_index": int(max(0, min(emergency_segment_count - 1, int(anchor_dist_m // emergency_segment_len_m)))),
-                        "segment_start_m": round(float(max(0.0, math.floor(anchor_dist_m / emergency_segment_len_m) * emergency_segment_len_m)), 2),
-                        "segment_end_m": round(float(min(route_len_m, (math.floor(anchor_dist_m / emergency_segment_len_m) + 1.0) * emergency_segment_len_m)), 2),
-                        "fork_distance_m": round(float(anchor_dist_m), 2),
-                        "fork_wgs": {"lon": round(float(fork_lon), 8), "lat": round(float(fork_lat), 8)},
-                        "landing_wgs": {"lon": round(float(landing_lon), 8), "lat": round(float(landing_lat), 8)},
-                        "landing_type_label": str(cand.get("landing_type_label", "应急备降点")),
-                        "safety_score": round(float(cand.get("safety_score", 0.0)), 4),
-                        "branch_length_m": round(float(branch_len_m), 2),
-                        "branch_waypoint_count": int(len(path_nodes_xy)),
-                        "fork_interior_angle_deg": round(float(fork_interior_deg), 2),
-                        "fork_deflection_deg": round(float(deflection_deg), 2),
-                        "target_distance_m": round(float(target_dist_m), 2),
-                        "objective_score": round(float(objective), 4),
-                        "points_wgs_alt": branch_wgs_alt,
-                        "branch_buffer_xy": branch_buffer,
-                        "altitude_meta": {
-                            "min_surface_clearance_m": _safe_float(branch_alt_meta.get("min_surface_clearance_m", 0.0), 0.0),
-                            "max_true_height_m": _safe_float(branch_alt_meta.get("max_true_height_m", 0.0), 0.0),
-                            "vertical_energy_proxy_m": _safe_float(branch_alt_meta.get("vertical_energy_proxy_m", 0.0), 0.0),
-                            "landing_overhead_true_height_m": round(float(landing_overhead_true_height_m), 2),
-                            "fork_main_route_true_height_m": round(float(fork_route_true_h or 0.0), 2),
-                        },
-                    }
-                    if objective < best_obj:
-                        best_obj = objective
-                        best_item = item
-            return best_item
-
-        candidates_by_target: List[List[Dict[str, Any]]] = []
-        raw_target_failures: List[Dict[str, Any]] = []
-        for target_idx, target_dist_m in enumerate(target_distances_m):
-            win_half = 0.9 * emergency_spacing_max_m
-            seg_start_m = max(0.0, float(target_dist_m) - win_half)
-            seg_end_m = min(route_len_m, float(target_dist_m) + win_half)
-            anchors = _build_emergency_anchor_distances(
-                seg_start_m=seg_start_m,
-                seg_end_m=seg_end_m,
-                route_len_m=route_len_m,
-                step_m=EMERGENCY_ROUTE_ANCHOR_STEP_M,
-            )
-            bucket: List[Dict[str, Any]] = []
-            seen_anchor = set()
-            for anchor_dist_m in anchors:
-                key_anchor = round(float(anchor_dist_m), 1)
-                if key_anchor in seen_anchor:
-                    continue
-                seen_anchor.add(key_anchor)
-                emergency_attempt_stats["anchor_attempts"] = int(emergency_attempt_stats.get("anchor_attempts", 0) + 1)
-                item = _build_emergency_candidate_for_anchor(anchor_dist_m, target_dist_m)
-                if item is not None:
-                    bucket.append(item)
-            dedupe = set()
-            uniq_bucket: List[Dict[str, Any]] = []
-            for item in sorted(bucket, key=lambda x: (float(x.get("objective_score", 999.0)), abs(float(x.get("fork_distance_m", 0.0)) - float(target_dist_m)))):
-                key = (
-                    round(float(item.get("fork_distance_m", 0.0)), 1),
-                    round(float((item.get("landing_wgs", {}) or {}).get("lon", 0.0)), 5),
-                    round(float((item.get("landing_wgs", {}) or {}).get("lat", 0.0)), 5),
-                )
-                if key in dedupe:
-                    continue
-                dedupe.add(key)
-                uniq_bucket.append(item)
-            if not uniq_bucket:
-                raw_target_failures.append(
-                    {
-                        "target_index": int(target_idx),
-                        "target_distance_km": round(float(target_dist_m) / 1000.0, 3),
-                        "reason": "no_feasible_branch_near_target",
-                    }
-                )
-            candidates_by_target.append(uniq_bucket[:8])
-
-        def _select_with_spacing(min_spacing_m: float) -> Optional[List[Dict[str, Any]]]:
-            chosen: List[Dict[str, Any]] = []
-            n_targets = len(candidates_by_target)
-
-            def _gap_ok(gap_m: float) -> bool:
-                return (gap_m <= emergency_spacing_max_m + 1e-6) and (gap_m + 1e-6 >= min_spacing_m)
-
-            def _future_feasible(cur_dist_m: float, remaining_targets: int) -> bool:
-                remain_len = route_len_m - cur_dist_m
-                min_need = float(remaining_targets + 1) * min_spacing_m
-                max_allow = float(remaining_targets + 1) * emergency_spacing_max_m
-                return (remain_len + 1e-6 >= min_need) and (remain_len <= max_allow + 1e-6)
-
-            def _dfs(idx: int) -> bool:
-                if idx >= n_targets:
-                    if not chosen:
-                        return False
-                    tail_gap = route_len_m - float(chosen[-1].get("fork_distance_m", 0.0))
-                    return _gap_ok(tail_gap)
-                bucket = candidates_by_target[idx]
-                if not bucket:
-                    return False
-                for item in bucket:
-                    d = float(item.get("fork_distance_m", 0.0))
-                    if idx == 0:
-                        if not _gap_ok(d):
-                            continue
-                    else:
-                        prev_d = float(chosen[-1].get("fork_distance_m", 0.0))
-                        if not _gap_ok(d - prev_d):
-                            continue
-                    if not _future_feasible(d, n_targets - idx - 1):
-                        continue
-                    chosen.append(item)
-                    if _dfs(idx + 1):
-                        return True
-                    chosen.pop()
-                return False
-
-            ok = _dfs(0)
-            if not ok:
-                return None
-            return [dict(x) for x in chosen]
-
-        selected_items = _select_with_spacing(emergency_spacing_min_used_m)
-        if selected_items is None:
-            fallback: List[Dict[str, Any]] = []
-            last_d = None
-            for bucket in candidates_by_target:
-                for item in bucket:
-                    d = float(item.get("fork_distance_m", 0.0))
-                    if d + 1e-6 < emergency_spacing_min_used_m:
-                        continue
-                    if last_d is not None and (d - last_d + 1e-6 < emergency_spacing_min_used_m):
-                        continue
-                    fallback.append(item)
-                    last_d = d
-                    break
-            selected_items = fallback
-
-        selected_items = sorted(selected_items or [], key=lambda x: float(x.get("fork_distance_m", 0.0)))
-        for ridx, route_item in enumerate(selected_items):
-            route_name = f"{base_name}_emergency_r{ridx + 1:02d}"
-            route_item["name"] = route_name
-            emergency_routes_for_html.append(route_item)
-            emergency_routes_for_kml.append({"name": route_name, "points_wgs_alt": route_item.get("points_wgs_alt") or []})
-            emergency_routes_summary.append(
-                {
-                    "name": route_name,
-                    "segment_index": int(route_item.get("segment_index", 0)),
-                    "segment_start_km": round(float(route_item.get("segment_start_m", 0.0)) / 1000.0, 3),
-                    "segment_end_km": round(float(route_item.get("segment_end_m", 0.0)) / 1000.0, 3),
-                    "fork_distance_km": round(float(route_item.get("fork_distance_m", 0.0)) / 1000.0, 3),
-                    "fork_wgs": route_item.get("fork_wgs", {}),
-                    "landing_wgs": route_item.get("landing_wgs", {}),
-                    "landing_type_label": route_item.get("landing_type_label", ""),
-                    "safety_score": route_item.get("safety_score", 0.0),
-                    "branch_length_m": route_item.get("branch_length_m", 0.0),
-                    "branch_waypoint_count": int(route_item.get("branch_waypoint_count", 0)),
-                    "fork_interior_angle_deg": route_item.get("fork_interior_angle_deg", 0.0),
-                    "fork_deflection_deg": route_item.get("fork_deflection_deg", 0.0),
-                    "target_distance_km": round(float(route_item.get("target_distance_m", 0.0)) / 1000.0, 3),
-                    "objective_score": route_item.get("objective_score", 0.0),
-                    "altitude_meta": route_item.get("altitude_meta", {}),
-                }
-            )
-
-        checkpoints = [0.0] + [float(x.get("fork_distance_m", 0.0)) for x in selected_items] + [route_len_m]
-        for gidx in range(len(checkpoints) - 1):
-            d0 = checkpoints[gidx]
-            d1 = checkpoints[gidx + 1]
-            gap_m = max(0.0, d1 - d0)
-            role = "start_to_first" if gidx == 0 else ("last_to_end" if gidx == len(checkpoints) - 2 else "between_branches")
-            too_far = bool(gap_m > emergency_spacing_max_m + 1e-6)
-            too_close = bool(gap_m + 1e-6 < emergency_spacing_min_used_m)
-            emergency_gap_checks.append(
-                {
-                    "index": int(gidx),
-                    "role": role,
-                    "from_km": round(d0 / 1000.0, 3),
-                    "to_km": round(d1 / 1000.0, 3),
-                    "gap_km": round(gap_m / 1000.0, 3),
-                    "too_far": too_far,
-                    "too_close": too_close,
-                }
-            )
-            if too_far:
-                emergency_uncovered_segments.append(
-                    {
-                        "segment_index": int(gidx),
-                        "segment_start_km": round(d0 / 1000.0, 3),
-                        "segment_end_km": round(d1 / 1000.0, 3),
-                        "reason_samples": ["gap_exceeds_max_spacing"],
-                    }
-                )
-
-        for info in raw_target_failures:
-            emergency_uncovered_segments.append(
-                {
-                    "segment_index": int(info.get("target_index", 0)),
-                    "segment_start_km": round(float(info.get("target_distance_km", 0.0)), 3),
-                    "segment_end_km": round(float(info.get("target_distance_km", 0.0)), 3),
-                    "reason_samples": [str(info.get("reason", "unknown"))],
-                }
-            )
-
-        if args.emergency_strict:
-            has_too_close = any(bool(x.get("too_close", False)) for x in emergency_gap_checks)
-            if emergency_uncovered_segments or has_too_close:
-                raise RuntimeError(
-                    "Emergency route spacing/coverage failed under strict mode "
-                    f"(uncovered={len(emergency_uncovered_segments)}, too_close={int(has_too_close)})."
-                )
-
-    emergency_covered_segments = max(0, emergency_segment_count - len(emergency_uncovered_segments))
-    emergency_coverage_ratio = emergency_covered_segments / max(1, emergency_segment_count)
-    emergency_plan_summary = {
-        "enabled": bool(emergency_plan_enabled),
-        "segment_count": int(emergency_segment_count),
-        "covered_segment_count": int(emergency_covered_segments),
-        "coverage_ratio": round(float(emergency_coverage_ratio), 4),
-        "uncovered_segments": emergency_uncovered_segments,
-        "gap_checks": emergency_gap_checks,
-        "routes": emergency_routes_summary,
-        "landing_source_counter": emergency_landing_source_counter,
-        "attempt_stats": emergency_attempt_stats,
-        "rules": {
-            "segment_length_m": round(float(emergency_segment_len_m), 2),
-            "spacing_max_m": round(float(emergency_spacing_max_m), 2),
-            "spacing_min_required_m": round(float(emergency_spacing_min_req_m), 2),
-            "spacing_min_used_m": round(float(emergency_spacing_min_used_m), 2),
-            "max_branch_length_m": round(float(emergency_max_branch_m), 2),
-            "branch_buffer_m": float(ROUTE_BUFFER_M),
-            "search_radius_m": round(float(emergency_search_radius_m), 2),
-            "min_fork_interior_angle_deg": round(float(emergency_min_fork_angle_deg), 2),
-            "landing_overhead_max_true_height_m": round(float(emergency_terminal_max_true_height_m), 2),
-            "strict_mode": bool(args.emergency_strict),
-        },
-        "kml": "",
-    }
-    if emergency_routes_for_kml:
-        write_emergency_routes_kml(emergency_kml_out, emergency_routes_for_kml, f"{base_name}_emergency_branches")
-        emergency_plan_summary["kml"] = str(emergency_kml_out)
     landuse_display_counter = {
         "total": int(len(landuse_geoms)),
         "low_cost": int(sum(1 for c in landuse_costs if c <= 0.6)),
@@ -11497,7 +8222,6 @@ def main() -> None:
                 "profile_samples": cand.get("altitude_profile_samples") or [],
                 "distance_km": cand["distance_km"],
                 "route_buffer_xy": cand["route_buffer_xy"],
-                "existing_route_profile_markers": cand.get("existing_route_profile_markers", []),
                 "show": show_flag,
             }
         )
@@ -11523,8 +8247,6 @@ def main() -> None:
                 "kml": candidate_kml_outputs.get(cid, ""),
                 "buffer_metrics": cand["buffer_metrics"],
                 "route_selection_strategy": cand["strategy"],
-                "existing_route_3d_conflicts": cand.get("existing_route_3d_conflicts", {}),
-                "existing_route_profile_marker_count": int(len(cand.get("existing_route_profile_markers", []) or [])),
             }
         )
     run_ts = time.time()
@@ -11566,7 +8288,6 @@ def main() -> None:
         )
     if candidate_failures:
         candidate_summary.append({"failures": candidate_failures})
-    candidate_summary.append({"emergency_plan": emergency_plan_summary})
     selected_quality = quality_variants_for_html.get(str(selected_candidate["id"]), {})
     coverage_payload = {
         "version": "engineering_product_v1",
@@ -11575,7 +8296,6 @@ def main() -> None:
         "selected_candidate_id": str(selected_candidate["id"]),
         "selected_candidate_label": str(selected_candidate["label"]),
         "candidates": quality_variants_for_html,
-        "emergency_plan": emergency_plan_summary,
     }
     coverage_out.write_text(json.dumps(coverage_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -11618,32 +8338,6 @@ def main() -> None:
     }
     pareto_out.write_text(json.dumps(pareto_payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    summary_outputs = summary.get("outputs", {}) if isinstance(summary, dict) else {}
-
-    def _output_path_exists(group: str, key: str) -> bool:
-        try:
-            group_obj = summary_outputs.get(group, {}) if isinstance(summary_outputs, dict) else {}
-            raw = group_obj.get(key, "") if isinstance(group_obj, dict) else ""
-            return bool(raw) and Path(str(raw)).exists()
-        except Exception:
-            return False
-
-    layer_source_status = {
-        "population_source_ready": bool(population_tiles_template) or _output_path_exists("population", "clipped_tif"),
-        "landuse_source_ready": _output_path_exists("landuse", "geojson"),
-        "poi_source_ready": _output_path_exists("poi", "geojson"),
-        "transport_source_ready": _output_path_exists("transport", "roads_geojson")
-        or _output_path_exists("transport", "hsr_geojson")
-        or _output_path_exists("hydro", "water_surface_geojson")
-        or _output_path_exists("hydro", "waterway_geojson"),
-        "civil_airport_source_ready": Path(args.civil_airport_no_fly_geojson).resolve().exists(),
-        "nofly_overpass_source_ready": bool(nofly_counter.get("overpass_query_ok", False)),
-        "school_source_ready": bool(school_counter.get("overpass_query_ok", False)),
-        "building_source_ready": bool(obstacle_counter.get("overpass_query_ok", False)),
-        "custom_nofly_source_ready": bool(custom_nofly_polys_xy),
-        "existing_route_source_ready": bool(existing_route_lines_xy),
-    }
-
     write_kml_absolute(kml_out, points_wgs_alt, base_name)
     write_preview_html(
         html_out,
@@ -11652,18 +8346,10 @@ def main() -> None:
         quality_variants=quality_variants_for_html,
         start_wgs=start_wgs,
         end_wgs=end_wgs,
-        custom_no_fly_polys_xy=custom_nofly_polys_xy,
         civil_airport_polys_xy=civil_airport_display_polys_xy,
         military_hard_nofly_polys_xy=nofly_military_hard_polys_xy,
         heli_soft_nofly_polys_xy=nofly_heli_soft_polys_xy,
-        existing_route_lines_xy=existing_route_lines_xy,
-        existing_route_corridors_xy=existing_route_corridors_xy,
-        existing_route_relief_union_xy=existing_route_relief_union_xy,
-        existing_route_horizontal_buffer_m=float(existing_route_horizontal_buffer_m),
-        existing_route_vertical_buffer_m=float(existing_route_vertical_buffer_m),
-        existing_route_endpoint_relief_m=float(existing_route_endpoint_relief_m),
         route_buffer_xy=route_buffer_xy,
-        emergency_routes=emergency_routes_for_html,
         dynamic_grb_xy=dynamic_grb_xy,
         population_points_wgs=population_points_wgs,
         population_tiles_template=population_tiles_template,
@@ -11687,7 +8373,6 @@ def main() -> None:
         key_point_tooltips_xy=key_point_tooltips_xy,
         inv=inv,
         name=base_name,
-        layer_source_status=layer_source_status,
     )
     cand_out.write_text(json.dumps(candidate_summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -11722,26 +8407,6 @@ def main() -> None:
         },
         "waypoints_xy": len(route_nodes),
         "open_data_no_fly_enabled": bool(args.open_data_no_fly),
-        "custom_no_fly_enabled": bool(custom_nofly_files_abs),
-        "custom_no_fly_files": custom_nofly_files_abs,
-        "custom_no_fly_zone_count": int(len(custom_nofly_polys_xy)),
-        "existing_route_avoidance": {
-            "enabled": bool(existing_route_lines_xy),
-            "aggregated_3d_constraint_model": bool(existing_route_lines_xy),
-            "routes_dir": str(existing_routes_load_stats.get("directory", "")),
-            "horizontal_buffer_m": float(existing_route_horizontal_buffer_m),
-            "vertical_buffer_m": float(existing_route_vertical_buffer_m),
-            "endpoint_relief_m": float(existing_route_endpoint_relief_m),
-            "loaded_files": int(existing_routes_load_stats.get("loaded_files", 0)),
-            "files_total": int(existing_routes_load_stats.get("files_total", 0)),
-            "failed_files": existing_routes_load_stats.get("failed_files", []),
-            "loaded_route_count": int(len(existing_route_lines_xy)),
-            "selected_candidate_conflict_samples": int(
-                (selected_candidate.get("existing_route_3d_conflicts") or {}).get("conflict_samples", 0)
-            ),
-            "selected_profile_marker_count": int(len(selected_candidate.get("existing_route_profile_markers", []) or [])),
-            "altitude_reference": "MSL",
-        },
         "no_fly_sources": nofly_counter,
         "network_stats": graph_stats,
         "poi_risk_sources": poi_risk_counter,
@@ -11777,13 +8442,11 @@ def main() -> None:
             "critical_infra_geoms_in_buffer": int(infra_in_buffer),
             "line_risk_overlap_m": round(line_overlap_m, 2),
             "high_building_overlap_m": round(high_build_overlap_m, 2),
-            "existing_route_3d_conflict_samples": int(existing_route_conflict_samples),
             "dynamic_grb_area_m2": round(dynamic_grb_area_m2, 2),
         },
         "route_cost_base": route_cost_base,
         "route_cost_water_priority": route_cost_water,
         "candidate_options": candidate_summary,
-        "emergency_plan": emergency_plan_summary,
         "pareto": pareto_payload,
         "airframe": {
             "speed_ms": args.speed_ms,
@@ -11802,9 +8465,6 @@ def main() -> None:
             "sensitive_facility_buffer_m": float(args.safety_sensitive_hard_buffer_m),
             "critical_infrastructure_buffer_m": float(args.safety_infra_hard_buffer_m),
             "legacy_global_infra_buffer_m": float(args.infra_hard_buffer_m),
-            "existing_route_horizontal_buffer_m": float(existing_route_horizontal_buffer_m),
-            "existing_route_vertical_buffer_m": float(existing_route_vertical_buffer_m),
-            "existing_route_endpoint_relief_m": float(existing_route_endpoint_relief_m),
         },
         "route_postprocess": {
             "min_turn_keep_deg": float(args.min_turn_keep_deg),

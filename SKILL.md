@@ -110,6 +110,10 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - `--pareto-business-line`: business-line override key (default `default`)
 - `--open-data-no-fly`: enable no-fly filtering (civil airports from CAAC dataset + heliport/helipad/military from OSM/Overpass)
 - `--civil-airport-no-fly-geojson`: path to civil-airport no-fly dataset (default `skills/plan-auto-route/config/civil_airport_no_fly.geojson`)
+- `--existing-routes-dir`: optional directory containing existing-route KML files; loaded as 3D hard-avoid constraints
+- `--existing-route-horizontal-buffer-m`: existing-route horizontal hard-avoid half-width (default `30m`)
+- `--existing-route-vertical-buffer-m`: existing-route vertical hard-avoid half-width (default `20m`)
+- `--existing-route-endpoint-relief-m`: relax existing-route 3D hard-avoid within this radius around start/end (default `200m`)
 - `--soft-no-fly-scale`: adjust soft no-fly penalty strength (e.g., `0.6` more efficiency, `1.5` more conservative)
 - `--safety-sensitive-hard-buffer-m`: hard exclusion buffer around sensitive facilities for safety route
 - `--safety-infra-hard-buffer-m`: hard exclusion buffer around critical infrastructure for safety route
@@ -142,6 +146,7 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - Plan meta: `output/auto_routes/<name>_meta.json`
 - Candidate summary: `output/auto_routes/<name>_candidates.json`
 - Pareto summary: `output/auto_routes/<name>_pareto.json`
+- Coverage summary: `output/auto_routes/<name>_coverage.json`
 - Evidence pack: `output/auto_routes/<name>_evidence.json`
 - Snapshot manifest: `output/auto_routes/snapshots/<name>_snapshot.json`
 - Optional layered review HTML:
