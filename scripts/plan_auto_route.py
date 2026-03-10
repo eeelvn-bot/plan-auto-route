@@ -26,7 +26,7 @@ import folium
 from folium.plugins import HeatMap
 import pyproj
 from osgeo import gdal
-from shapely.geometry import LineString, Point, Polygon, shape
+from shapely.geometry import LineString, Point, Polygon, mapping, shape
 from shapely.ops import nearest_points, substring, transform, unary_union
 from shapely.strtree import STRtree
 
@@ -52,6 +52,12 @@ ALGORITHM_VERSION = "plan-auto-route-latest-air-corridor-v4-refactor-landuse-sof
 OVERPASS_CACHE_DIR = Path(__file__).resolve().parents[3] / "output" / "overpass_cache"
 DEFAULT_PARETO_POLICY_FILE = Path(__file__).resolve().parents[1] / "config" / "pareto_policies.json"
 DEFAULT_CIVIL_AIRPORT_NO_FLY_GEOJSON = Path(__file__).resolve().parents[1] / "config" / "civil_airport_no_fly.geojson"
+WORLDPOP_CHN_2020_URL = (
+    "https://data.worldpop.org/GIS/Population_Density/"
+    "Global_2000_2020_1km_UNadj/2020/CHN/chn_pd_2020_1km_UNadj.tif"
+)
+DEFAULT_POI_KEYS = ["amenity", "shop", "tourism", "leisure", "office", "place", "military"]
+DEFAULT_LANDUSE_KEYS = ["landuse", "natural", "leisure"]
 
 DEFAULT_AIRFRAME = {
     "speed_ms": 12.0,
@@ -95,6 +101,14 @@ LOW_ALT_STEP_HOLD_M = 2.0
 LOW_ALT_CLIMB_COMMIT_M = 6.0
 LOW_ALT_CLIMB_LOOKAHEAD_M = 520.0
 LOW_ALT_CLIMB_MARGIN_M = 80.0
+ALT_CLUSTER_HIGH_TRIGGER_M = 8.0
+ALT_CLUSTER_MIN_ZONE_LEN_M = 120.0
+ALT_CLUSTER_MERGE_GAP_M = 1100.0
+ALT_CLUSTER_ZONE_PAD_M = 160.0
+ALT_CLUSTER_PRECLIMB_BUFFER_M = 90.0
+ALT_CLUSTER_DESCENT_HOLD_M = 60.0
+ALT_CLUSTER_LOW_PLATFORM_CAP_RISE_M = 18.0
+ALT_CLUSTER_MULTI_WINDOW_MAX_RATIO = 0.65
 ALT_PLATEAU_LEVEL_TOL_M = 0.25
 ALT_PLATEAU_MIN_LEN_M = 120.0
 ALT_PLATEAU_SMALL_STEP_M = 3.0
@@ -148,6 +162,7 @@ HUMANIZE_COLLINEAR_SHORT_MAX_M = 180.0
 HUMANIZE_ALTITUDE_LATERAL_TOL_M = 10.0
 HUMANIZE_ALTITUDE_INTERP_TOL_M = 4.5
 HUMANIZE_ALTITUDE_LINK_ERR_TOL_M = 4.0
+COORD_OUTPUT_DECIMALS = 7
 QUALITY_SOURCE_CEILINGS = {
     "dem": 0.85,
     "building_obstacle": 0.80,
@@ -844,8 +859,8 @@ def build_existing_route_profile_markers(
             if dist_h < best_dist - 1e-6 or (abs(dist_h - best_dist) <= 1e-6 and abs_delta_msl < best_abs_delta):
                 best = {
                     "distance_m": round(_safe_float(sample.get("distance_m", 0.0), 0.0), 2),
-                    "lon": round(float(lon), 8),
-                    "lat": round(float(lat), 8),
+                    "lon": round(float(lon), COORD_OUTPUT_DECIMALS),
+                    "lat": round(float(lat), COORD_OUTPUT_DECIMALS),
                     "horizontal_m": round(dist_h, 2),
                     "candidate_alt_msl_m": round(float(alt_msl), 2),
                     "existing_alt_msl_m": round(float(existing_alt_msl), 2),
@@ -1002,50 +1017,760 @@ def load_custom_no_fly_polygons_from_kml(kml_path: Path, fwd) -> Tuple[List[Any]
     return out, stats
 
 
-def _summary_complete(summary: Dict[str, Any]) -> bool:
-    outputs = summary.get("outputs", {})
-    required = ["poi", "landuse", "population", "transport"]
-    return all(k in outputs for k in required)
+def _safe_slug(value: str) -> str:
+    text = str(value or "").strip().replace(" ", "_")
+    text = re.sub(r"[^0-9A-Za-z_-]+", "-", text)
+    text = text.strip("-_")
+    return text or "city"
 
 
-def _find_city_cache_dir(root: Path, city: str) -> Optional[Path]:
-    direct = root / "output" / "city_data_cache" / city
-    if direct.exists():
-        return direct
-    candidates = sorted((root / "output" / "city_data_cache").glob("*"))
-    city_norm = city.strip()
-    for c in candidates:
-        if c.name == city_norm:
-            return c
+def _bbox_hash(bbox_wgs: Tuple[float, float, float, float]) -> str:
+    south, north, west, east = bbox_wgs
+    raw = f"{south:.6f}|{north:.6f}|{west:.6f}|{east:.6f}"
+    return hashlib.sha1(raw.encode("utf-8")).hexdigest()[:10]
+
+
+def _bbox_to_polygon(bbox_wgs: Tuple[float, float, float, float]) -> Polygon:
+    south, north, west, east = bbox_wgs
+    return Polygon([(west, south), (east, south), (east, north), (west, north), (west, south)])
+
+
+def _bbox_from_summary(summary: Dict[str, Any]) -> Optional[Tuple[float, float, float, float]]:
+    bbox = summary.get("bbox", {}) if isinstance(summary, dict) else {}
+    if not isinstance(bbox, dict):
+        return None
+    south = _first_float(bbox.get("south"))
+    north = _first_float(bbox.get("north"))
+    west = _first_float(bbox.get("west"))
+    east = _first_float(bbox.get("east"))
+    if south is None or north is None or west is None or east is None:
+        return None
+    if not (south < north and west < east):
+        return None
+    return (float(south), float(north), float(west), float(east))
+
+
+def _city_token_for_cache(name: str) -> str:
+    token = str(name or "").strip().lower()
+    token = re.sub(r"\\s+", "", token)
+    if token.endswith("市") and len(token) > 1:
+        token = token[:-1]
+    return token
+
+
+def _feature_uid(feat: Dict[str, Any]) -> str:
+    props = feat.get("properties", {}) if isinstance(feat.get("properties", {}), dict) else {}
+    fid = str(props.get("id", "")).strip()
+    if fid:
+        return f"id:{fid}"
+    geom = feat.get("geometry", {}) if isinstance(feat.get("geometry", {}), dict) else {}
+    digest = hashlib.sha1(json.dumps(geom, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"geom:{digest}"
+
+
+def _merge_unique_features(*groups: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for features in groups:
+        for feat in features or []:
+            uid = _feature_uid(feat)
+            if uid in seen:
+                continue
+            seen.add(uid)
+            out.append(feat)
+    return out
+
+
+def _filter_features_to_bbox(
+    features: List[Dict[str, Any]],
+    bbox_wgs: Tuple[float, float, float, float],
+) -> List[Dict[str, Any]]:
+    bbox_poly = _bbox_to_polygon(bbox_wgs)
+    out: List[Dict[str, Any]] = []
+    for feat in features:
+        try:
+            geom_obj = feat.get("geometry") or {}
+            geom = shape(geom_obj)
+        except Exception:
+            continue
+        try:
+            if geom.is_empty or (not geom.intersects(bbox_poly)):
+                continue
+        except Exception:
+            continue
+        out.append(feat)
+    return out
+
+
+def _summary_output_path(summary: Dict[str, Any], group: str, key: str) -> Optional[Path]:
+    outputs = summary.get("outputs", {}) if isinstance(summary, dict) else {}
+    if not isinstance(outputs, dict):
+        return None
+    group_obj = outputs.get(group, {})
+    if not isinstance(group_obj, dict):
+        return None
+    raw = str(group_obj.get(key, "")).strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        path = path.resolve()
+    return path if path.exists() else None
+
+
+def _load_layer_features_from_summary(summary: Dict[str, Any], group: str, key: str) -> List[Dict[str, Any]]:
+    path = _summary_output_path(summary, group, key)
+    if path is None:
+        return []
+    return load_geojson_features(path)
+
+
+def _cached_bbox_summaries(root: Path, city: str) -> List[Dict[str, Any]]:
+    cache_root = root / "output" / "auto_route_bbox_cache"
+    if not cache_root.exists():
+        return []
+    target_token = _city_token_for_cache(city)
+    out: List[Dict[str, Any]] = []
+    for item in sorted(cache_root.glob("*/download_summary.json")):
+        try:
+            summary = json.loads(item.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if not isinstance(summary, dict):
+            continue
+        city_name = str(summary.get("city", "")).strip()
+        if _city_token_for_cache(city_name) != target_token:
+            continue
+        bbox = _bbox_from_summary(summary)
+        if bbox is None:
+            continue
+        out.append({"summary": summary, "summary_path": item.resolve(), "bbox": bbox})
+    return out
+
+
+def _iter_polygon_parts(geom_obj) -> List[Any]:
+    if geom_obj is None or getattr(geom_obj, "is_empty", True):
+        return []
+    if geom_obj.geom_type == "Polygon":
+        return [geom_obj]
+    if geom_obj.geom_type == "MultiPolygon":
+        return [g for g in geom_obj.geoms if g is not None and (not g.is_empty)]
+    if geom_obj.geom_type == "GeometryCollection":
+        out: List[Any] = []
+        for sub in geom_obj.geoms:
+            out.extend(_iter_polygon_parts(sub))
+        return out
+    return []
+
+
+def _missing_bboxes_from_overlap(
+    target_bbox: Tuple[float, float, float, float],
+    overlap_bboxes: List[Tuple[float, float, float, float]],
+    max_boxes: int = 8,
+) -> List[Tuple[float, float, float, float]]:
+    target_poly = _bbox_to_polygon(target_bbox)
+    if not overlap_bboxes:
+        return [target_bbox]
+    unions: List[Any] = []
+    for bbox in overlap_bboxes:
+        poly = _bbox_to_polygon(bbox)
+        if not poly.is_empty and poly.intersects(target_poly):
+            unions.append(poly)
+    if not unions:
+        return [target_bbox]
+    coverage = unary_union(unions)
+    try:
+        missing = target_poly.difference(coverage)
+    except Exception:
+        return [target_bbox]
+    if missing is None or missing.is_empty:
+        return []
+    boxes: List[Tuple[float, float, float, float]] = []
+    for part in _iter_polygon_parts(missing):
+        minx, miny, maxx, maxy = part.bounds
+        south = max(float(target_bbox[0]), float(miny))
+        north = min(float(target_bbox[1]), float(maxy))
+        west = max(float(target_bbox[2]), float(minx))
+        east = min(float(target_bbox[3]), float(maxx))
+        if south >= north or west >= east:
+            continue
+        boxes.append((south, north, west, east))
+    if not boxes:
+        return []
+    if len(boxes) > max_boxes:
+        min_s = min(b[0] for b in boxes)
+        max_n = max(b[1] for b in boxes)
+        min_w = min(b[2] for b in boxes)
+        max_e = max(b[3] for b in boxes)
+        return [(min_s, max_n, min_w, max_e)]
+    out: List[Tuple[float, float, float, float]] = []
+    seen: set[Tuple[float, float, float, float]] = set()
+    for b in boxes:
+        key = (round(b[0], 6), round(b[1], 6), round(b[2], 6), round(b[3], 6))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(b)
+    return out
+
+
+def _query_poi_features_multi(bboxes: List[Tuple[float, float, float, float]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for bbox in bboxes:
+        out = _merge_unique_features(out, _query_poi_features_bbox(bbox))
+    return out
+
+
+def _query_landuse_features_multi(bboxes: List[Tuple[float, float, float, float]]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for bbox in bboxes:
+        out = _merge_unique_features(out, _query_landuse_features_bbox(bbox))
+    return out
+
+
+def _query_transport_features_multi(
+    bboxes: List[Tuple[float, float, float, float]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    roads: List[Dict[str, Any]] = []
+    hsr: List[Dict[str, Any]] = []
+    for bbox in bboxes:
+        r, h = _query_transport_features_bbox(bbox)
+        roads = _merge_unique_features(roads, r)
+        hsr = _merge_unique_features(hsr, h)
+    return roads, hsr
+
+
+def _query_hydro_features_multi(
+    bboxes: List[Tuple[float, float, float, float]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    surfaces: List[Dict[str, Any]] = []
+    waterways: List[Dict[str, Any]] = []
+    for bbox in bboxes:
+        s, w = _query_hydro_features_bbox(bbox)
+        surfaces = _merge_unique_features(surfaces, s)
+        waterways = _merge_unique_features(waterways, w)
+    return surfaces, waterways
+
+
+def _query_line_risk_features_bbox(bbox_wgs: Tuple[float, float, float, float]) -> List[Dict[str, Any]]:
+    south, north, west, east = bbox_wgs
+    query = f"""
+[out:json][timeout:120];
+(
+  way({south},{west},{north},{east})[highway~"^(motorway|trunk|primary)$"];
+  way({south},{west},{north},{east})[railway=rail];
+  way({south},{west},{north},{east})[power~"^(line|minor_line)$"][voltage];
+);
+out geom tags;
+""".strip()
+    try:
+        data = run_overpass(query, timeout=120)
+    except Exception:
+        return []
+    out: List[Dict[str, Any]] = []
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        geom = _geometry_from_overpass_element(el)
+        if geom is None or geom.geom_type not in {"LineString", "MultiLineString"}:
+            continue
+        line_type = ""
+        hwy = str(tags.get("highway", "")).strip().lower()
+        railway = str(tags.get("railway", "")).strip().lower()
+        highspeed = str(tags.get("highspeed", "")).strip().lower()
+        power = str(tags.get("power", "")).strip().lower()
+        if hwy in {"motorway", "trunk", "primary"}:
+            line_type = "highway"
+        elif railway == "rail" and (highspeed in {"yes", "designated"} or _is_hsr_way(tags)):
+            line_type = "hsr"
+        elif power in {"line", "minor_line"}:
+            voltage_v = _max_voltage_v(tags.get("voltage"))
+            if voltage_v is not None and voltage_v >= HIGH_VOLTAGE_LINE_MIN_V:
+                line_type = "high_voltage_power_line"
+        if not line_type:
+            continue
+        fid = f"{el.get('type', 'obj')}/{el.get('id', '')}"
+        out.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(geom),
+                "properties": {
+                    "id": fid,
+                    "line_risk_type": line_type,
+                    "name": tags.get("name", ""),
+                    "highway": str(tags.get("highway", "")),
+                    "railway": str(tags.get("railway", "")),
+                    "highspeed": str(tags.get("highspeed", "")),
+                    "power": str(tags.get("power", "")),
+                    "voltage": str(tags.get("voltage", "")),
+                    "raw_tags": tags,
+                },
+            }
+        )
+    return out
+
+
+def _query_line_risk_features_multi(
+    bboxes: List[Tuple[float, float, float, float]],
+) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    for bbox in bboxes:
+        out = _merge_unique_features(out, _query_line_risk_features_bbox(bbox))
+    return out
+
+
+def _pick_element_center_wgs(el: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    lon = _first_float(el.get("lon"))
+    lat = _first_float(el.get("lat"))
+    if lon is not None and lat is not None:
+        return float(lon), float(lat)
+    center = el.get("center") or {}
+    lon = _first_float(center.get("lon"))
+    lat = _first_float(center.get("lat"))
+    if lon is not None and lat is not None:
+        return float(lon), float(lat)
+    geom = el.get("geometry") or []
+    if isinstance(geom, list) and geom:
+        lons: List[float] = []
+        lats: List[float] = []
+        for item in geom:
+            glon = _first_float(item.get("lon"))
+            glat = _first_float(item.get("lat"))
+            if glon is None or glat is None:
+                continue
+            lons.append(float(glon))
+            lats.append(float(glat))
+        if lons and lats:
+            return float(sum(lons) / len(lons)), float(sum(lats) / len(lats))
     return None
 
 
-def ensure_city_data(root: Path, city: str, zoom: str = "8-14") -> Path:
-    city_dir = root / "output" / "city_data_cache" / city
-    city_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = city_dir / "download_summary.json"
-    if summary_path.exists():
-        try:
-            summary = json.loads(summary_path.read_text(encoding="utf-8"))
-            if _summary_complete(summary):
-                print(f"[SKIP] city data exists: {city} -> {city_dir}", flush=True)
-                return summary_path
-        except Exception:
-            pass
-    script = root / "skills" / "city-data-downloader" / "scripts" / "download_city_data.py"
-    run_cmd(
+def _query_poi_features_bbox(bbox_wgs: Tuple[float, float, float, float]) -> List[Dict[str, Any]]:
+    south, north, west, east = bbox_wgs
+    blocks_raw: List[str] = []
+    for key in DEFAULT_POI_KEYS:
+        if key == "amenity":
+            blocks_raw.append(f'  nwr({south},{west},{north},{east})[amenity][amenity!~"^(school|kindergarten)$"];')
+        else:
+            blocks_raw.append(f"  nwr({south},{west},{north},{east})[{key}];")
+    blocks = "\n".join(blocks_raw)
+    query = f"""
+[out:json][timeout:120];
+(
+{blocks}
+);
+out center tags;
+""".strip()
+    try:
+        data = run_overpass(query, timeout=120)
+    except Exception:
+        return []
+    features: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        center = _pick_element_center_wgs(el)
+        if center is None:
+            continue
+        lon, lat = center
+        poi_type = ""
+        for key in DEFAULT_POI_KEYS:
+            if key in tags:
+                poi_type = f"{key}:{tags.get(key)}"
+                break
+        fid = f"{el.get('type', 'obj')}/{el.get('id', '')}"
+        if fid in seen_ids:
+            continue
+        seen_ids.add(fid)
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [lon, lat]},
+                "properties": {
+                    "id": fid,
+                    "osm_type": el.get("type", ""),
+                    "osm_id": el.get("id", ""),
+                    "name": tags.get("name", ""),
+                    "poi_type": poi_type,
+                    "raw_tags": tags,
+                },
+            }
+        )
+    return features
+
+
+def _query_landuse_features_bbox(bbox_wgs: Tuple[float, float, float, float]) -> List[Dict[str, Any]]:
+    south, north, west, east = bbox_wgs
+    blocks = "\n".join(
         [
-            "python3",
-            str(script),
-            "--city",
-            city,
-            "--outdir",
-            str(city_dir),
-            "--zoom",
-            zoom,
+            f"  way({south},{west},{north},{east})[{key}];\n  relation({south},{west},{north},{east})[{key}];"
+            for key in DEFAULT_LANDUSE_KEYS
         ]
     )
-    return summary_path
+    query = f"""
+[out:json][timeout:120];
+(
+{blocks}
+);
+out geom tags;
+""".strip()
+    try:
+        data = run_overpass(query, timeout=120)
+    except Exception:
+        return []
+    features: List[Dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for el in data.get("elements", []):
+        geom = _geometry_from_overpass_element(el)
+        if geom is None:
+            continue
+        if geom.geom_type not in {"Polygon", "MultiPolygon", "LineString", "MultiLineString"}:
+            continue
+        tags = el.get("tags") or {}
+        tag_key = ""
+        tag_val = ""
+        for key in DEFAULT_LANDUSE_KEYS:
+            if key in tags:
+                tag_key = key
+                tag_val = str(tags.get(key, ""))
+                break
+        landuse_type = f"{tag_key}:{tag_val}" if tag_key else "unknown:unknown"
+        fid = f"{el.get('type', 'obj')}/{el.get('id', '')}"
+        if fid in seen_ids:
+            continue
+        seen_ids.add(fid)
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": mapping(geom),
+                "properties": {
+                    "id": fid,
+                    "name": tags.get("name", ""),
+                    "landuse_type": landuse_type,
+                    "raw_tags": tags,
+                },
+            }
+        )
+    return features
+
+
+def _is_hsr_way(tags: Dict[str, Any]) -> bool:
+    if str(tags.get("highspeed", "")).strip().lower() in {"yes", "true", "1", "designated"}:
+        return True
+    if "高铁" in str(tags.get("name", "")):
+        return True
+    usage = str(tags.get("usage", "")).strip().lower()
+    maxspeed = str(tags.get("maxspeed", ""))
+    if usage == "main":
+        match = re.search(r"(\\d+)", maxspeed)
+        if match and int(match.group(1)) >= 200:
+            return True
+    return False
+
+
+def _query_transport_features_bbox(
+    bbox_wgs: Tuple[float, float, float, float],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    south, north, west, east = bbox_wgs
+    query = f"""
+[out:json][timeout:120];
+(
+  way({south},{west},{north},{east})[highway];
+  way({south},{west},{north},{east})[railway=rail][highspeed=yes];
+  way({south},{west},{north},{east})[railway=rail][name~"高铁"];
+  way({south},{west},{north},{east})[railway=rail][usage=main][maxspeed~"^(2[0-9]{{2}}|3[0-9]{{2}})$"];
+);
+out geom tags;
+""".strip()
+    try:
+        data = run_overpass(query, timeout=120)
+    except Exception:
+        return [], []
+    roads: List[Dict[str, Any]] = []
+    hsr: List[Dict[str, Any]] = []
+    seen_road: set[str] = set()
+    seen_hsr: set[str] = set()
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        if str(el.get("type", "")).lower() != "way":
+            continue
+        geom = _geometry_from_overpass_element(el)
+        if geom is None or geom.geom_type != "LineString":
+            continue
+        fid = f"way/{el.get('id', '')}"
+        props = {
+            "id": fid,
+            "name": tags.get("name", ""),
+            "highway": tags.get("highway", ""),
+            "railway": tags.get("railway", ""),
+            "highspeed": str(tags.get("highspeed", "")),
+            "usage": str(tags.get("usage", "")),
+            "maxspeed": str(tags.get("maxspeed", "")),
+            "raw_tags": tags,
+        }
+        if tags.get("highway"):
+            if fid in seen_road:
+                continue
+            seen_road.add(fid)
+            roads.append({"type": "Feature", "geometry": mapping(geom), "properties": props})
+        elif tags.get("railway") == "rail" and _is_hsr_way(tags):
+            if fid in seen_hsr:
+                continue
+            seen_hsr.add(fid)
+            hsr.append({"type": "Feature", "geometry": mapping(geom), "properties": props})
+    return roads, hsr
+
+
+def _query_hydro_features_bbox(
+    bbox_wgs: Tuple[float, float, float, float],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    south, north, west, east = bbox_wgs
+    query = f"""
+[out:json][timeout:120];
+(
+  way({south},{west},{north},{east})[natural=water];
+  relation({south},{west},{north},{east})[natural=water];
+  way({south},{west},{north},{east})[water];
+  relation({south},{west},{north},{east})[water];
+  way({south},{west},{north},{east})[landuse~"^(reservoir|basin)$"];
+  relation({south},{west},{north},{east})[landuse~"^(reservoir|basin)$"];
+  way({south},{west},{north},{east})[waterway=riverbank];
+  relation({south},{west},{north},{east})[waterway=riverbank];
+  way({south},{west},{north},{east})[waterway~"^(river|canal|stream|ditch|drain)$"];
+  relation({south},{west},{north},{east})[waterway~"^(river|canal|stream|ditch|drain)$"];
+);
+out geom tags;
+""".strip()
+    try:
+        data = run_overpass(query, timeout=120)
+    except Exception:
+        return [], []
+    surfaces: List[Dict[str, Any]] = []
+    waterways: List[Dict[str, Any]] = []
+    seen_surface: set[str] = set()
+    seen_waterway: set[str] = set()
+    for el in data.get("elements", []):
+        tags = el.get("tags") or {}
+        geom = _geometry_from_overpass_element(el)
+        if geom is None:
+            continue
+        layer_type = ""
+        waterway = str(tags.get("waterway", "")).strip().lower()
+        if waterway in {"river", "canal", "stream", "ditch", "drain"}:
+            layer_type = "waterway"
+        else:
+            natural = str(tags.get("natural", "")).strip().lower()
+            water = str(tags.get("water", "")).strip().lower()
+            landuse = str(tags.get("landuse", "")).strip().lower()
+            if natural == "water" or water or landuse in {"reservoir", "basin"} or waterway == "riverbank":
+                layer_type = "water_surface"
+        if not layer_type:
+            continue
+        fid = f"{el.get('type', 'obj')}/{el.get('id', '')}"
+        feat = {
+            "type": "Feature",
+            "geometry": mapping(geom),
+            "properties": {
+                "id": fid,
+                "name": tags.get("name", ""),
+                "layer_type": layer_type,
+                "subtype": waterway or str(tags.get("water", "")) or str(tags.get("natural", "")) or str(tags.get("landuse", "")),
+                "raw_tags": tags,
+            },
+        }
+        if layer_type == "waterway":
+            if fid in seen_waterway:
+                continue
+            seen_waterway.add(fid)
+            waterways.append(feat)
+        else:
+            if fid in seen_surface:
+                continue
+            seen_surface.add(fid)
+            surfaces.append(feat)
+    return surfaces, waterways
+
+
+def _write_feature_collection(path: Path, features: List[Dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"type": "FeatureCollection", "features": features}, ensure_ascii=False), encoding="utf-8")
+
+
+def _ensure_worldpop_tif(root: Path) -> Path:
+    data_dir = root / "data" / "population"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    target = data_dir / "chn_pd_2020_1km.tif"
+    if target.exists():
+        return target
+    print(f"Downloading WorldPop source: {target}", flush=True)
+    request.urlretrieve(WORLDPOP_CHN_2020_URL, target)
+    return target
+
+
+def _clip_population_tif_to_bbox(
+    source_tif: Path,
+    bbox_wgs: Tuple[float, float, float, float],
+    out_tif: Path,
+) -> Path:
+    out_tif.parent.mkdir(parents=True, exist_ok=True)
+    south, north, west, east = bbox_wgs
+    try:
+        ds = gdal.Open(str(source_tif))
+        if ds is None:
+            return source_tif
+        translated = gdal.Translate(
+            str(out_tif),
+            ds,
+            projWin=[float(west), float(north), float(east), float(south)],
+        )
+        ds = None
+        if translated is not None:
+            translated = None
+        if out_tif.exists():
+            return out_tif
+    except Exception:
+        pass
+    return source_tif
+
+
+def prepare_bbox_runtime_summary(
+    root: Path,
+    city: str,
+    bbox_wgs: Tuple[float, float, float, float],
+) -> Tuple[Path, Dict[str, Any]]:
+    tag = f"{_safe_slug(city)}_{_bbox_hash(bbox_wgs)}"
+    data_dir = root / "output" / "auto_route_bbox_cache" / tag
+    data_dir.mkdir(parents=True, exist_ok=True)
+    target_poly = _bbox_to_polygon(bbox_wgs)
+
+    cache_rows = _cached_bbox_summaries(root, city)
+    overlap_rows: List[Dict[str, Any]] = []
+    overlap_bboxes: List[Tuple[float, float, float, float]] = []
+    for row in cache_rows:
+        bbox_cached = row["bbox"]
+        poly_cached = _bbox_to_polygon(bbox_cached)
+        if not poly_cached.intersects(target_poly):
+            continue
+        overlap_rows.append(row)
+        overlap_bboxes.append(bbox_cached)
+    missing_bboxes = _missing_bboxes_from_overlap(bbox_wgs, overlap_bboxes)
+    if not overlap_rows and not missing_bboxes:
+        missing_bboxes = [bbox_wgs]
+
+    cached_poi: List[Dict[str, Any]] = []
+    cached_landuse: List[Dict[str, Any]] = []
+    cached_roads: List[Dict[str, Any]] = []
+    cached_hsr: List[Dict[str, Any]] = []
+    cached_water_surface: List[Dict[str, Any]] = []
+    cached_waterway: List[Dict[str, Any]] = []
+    cached_line_risk: List[Dict[str, Any]] = []
+    for row in overlap_rows:
+        summary_cached = row["summary"]
+        cached_poi = _merge_unique_features(cached_poi, _load_layer_features_from_summary(summary_cached, "poi", "geojson"))
+        cached_landuse = _merge_unique_features(cached_landuse, _load_layer_features_from_summary(summary_cached, "landuse", "geojson"))
+        cached_roads = _merge_unique_features(cached_roads, _load_layer_features_from_summary(summary_cached, "transport", "roads_geojson"))
+        cached_hsr = _merge_unique_features(cached_hsr, _load_layer_features_from_summary(summary_cached, "transport", "hsr_geojson"))
+        cached_water_surface = _merge_unique_features(
+            cached_water_surface,
+            _load_layer_features_from_summary(summary_cached, "hydro", "water_surface_geojson"),
+        )
+        cached_waterway = _merge_unique_features(
+            cached_waterway,
+            _load_layer_features_from_summary(summary_cached, "hydro", "waterway_geojson"),
+        )
+        cached_line_risk = _merge_unique_features(
+            cached_line_risk,
+            _load_layer_features_from_summary(summary_cached, "line_risk", "geojson"),
+        )
+
+    inc_poi = _query_poi_features_multi(missing_bboxes)
+    inc_landuse = _query_landuse_features_multi(missing_bboxes)
+    inc_roads, inc_hsr = _query_transport_features_multi(missing_bboxes)
+    inc_water_surface, inc_waterway = _query_hydro_features_multi(missing_bboxes)
+    inc_line_risk = _query_line_risk_features_multi(missing_bboxes)
+
+    poi_features = _filter_features_to_bbox(_merge_unique_features(cached_poi, inc_poi), bbox_wgs)
+    landuse_features = _filter_features_to_bbox(_merge_unique_features(cached_landuse, inc_landuse), bbox_wgs)
+    roads_features = _filter_features_to_bbox(_merge_unique_features(cached_roads, inc_roads), bbox_wgs)
+    hsr_features = _filter_features_to_bbox(_merge_unique_features(cached_hsr, inc_hsr), bbox_wgs)
+    water_surface_features = _filter_features_to_bbox(
+        _merge_unique_features(cached_water_surface, inc_water_surface),
+        bbox_wgs,
+    )
+    waterway_features = _filter_features_to_bbox(_merge_unique_features(cached_waterway, inc_waterway), bbox_wgs)
+    line_risk_features = _filter_features_to_bbox(_merge_unique_features(cached_line_risk, inc_line_risk), bbox_wgs)
+    pop_tif = _ensure_worldpop_tif(root)
+
+    poi_geojson = data_dir / "poi.geojson"
+    landuse_geojson = data_dir / "landuse.geojson"
+    roads_geojson = data_dir / "roads.geojson"
+    hsr_geojson = data_dir / "hsr.geojson"
+    water_surface_geojson = data_dir / "water_surface.geojson"
+    waterway_geojson = data_dir / "waterway.geojson"
+    line_risk_geojson = data_dir / "line_risk.geojson"
+    clipped_pop_tif = data_dir / "population_pd.tif"
+    tiles_dir_placeholder = data_dir / "population_tiles"
+
+    _write_feature_collection(poi_geojson, poi_features)
+    _write_feature_collection(landuse_geojson, landuse_features)
+    _write_feature_collection(roads_geojson, roads_features)
+    _write_feature_collection(hsr_geojson, hsr_features)
+    _write_feature_collection(water_surface_geojson, water_surface_features)
+    _write_feature_collection(waterway_geojson, waterway_features)
+    _write_feature_collection(line_risk_geojson, line_risk_features)
+    pop_tif_for_run = _clip_population_tif_to_bbox(pop_tif, bbox_wgs, clipped_pop_tif)
+
+    line_risk_counter = {"highway": 0, "hsr": 0, "high_voltage_power_line": 0}
+    for feat in line_risk_features:
+        props = feat.get("properties", {}) if isinstance(feat.get("properties", {}), dict) else {}
+        key = str(props.get("line_risk_type", "")).strip()
+        if key in line_risk_counter:
+            line_risk_counter[key] = int(line_risk_counter[key] + 1)
+
+    south, north, west, east = bbox_wgs
+    summary: Dict[str, Any] = {
+        "city": city,
+        "resolved_display_name": f"{city} (route_bbox_runtime)",
+        "bbox": {"south": float(south), "north": float(north), "west": float(west), "east": float(east)},
+        "cache_reuse": {
+            "overlap_cache_count": int(len(overlap_rows)),
+            "incremental_query_bbox_count": int(len(missing_bboxes)),
+            "incremental_query_bboxes": [
+                {"south": float(b[0]), "north": float(b[1]), "west": float(b[2]), "east": float(b[3])}
+                for b in missing_bboxes
+            ],
+        },
+        "outputs": {
+            "poi": {"geojson": str(poi_geojson), "count": str(len(poi_features))},
+            "landuse": {"geojson": str(landuse_geojson), "count": str(len(landuse_features))},
+            "hydro": {
+                "water_surface_geojson": str(water_surface_geojson),
+                "waterway_geojson": str(waterway_geojson),
+                "water_surface_count": str(len(water_surface_features)),
+                "waterway_count": str(len(waterway_features)),
+            },
+            "population": {
+                "clipped_tif": str(pop_tif_for_run),
+                "colored_tif": "",
+                "tiles_dir": str(tiles_dir_placeholder),
+            },
+            "transport": {
+                "roads_geojson": str(roads_geojson),
+                "hsr_geojson": str(hsr_geojson),
+                "roads_count": str(len(roads_features)),
+                "hsr_count": str(len(hsr_features)),
+            },
+            "line_risk": {
+                "geojson": str(line_risk_geojson),
+                "count": str(len(line_risk_features)),
+                "highway_count": str(line_risk_counter["highway"]),
+                "hsr_count": str(line_risk_counter["hsr"]),
+                "high_voltage_power_line_count": str(line_risk_counter["high_voltage_power_line"]),
+            },
+        },
+    }
+    summary_path = data_dir / "download_summary.json"
+    summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    return summary_path, summary
 
 
 def build_projectors(points_wgs: List[Tuple[float, float]]) -> Tuple[Any, Any]:
@@ -1406,6 +2131,7 @@ def build_line_risk_geometries(
     fwd,
 ) -> Tuple[List[Any], Any, List[Any], List[Any], Dict[str, int]]:
     outputs = summary.get("outputs", {})
+    line_risk_geojson = Path(outputs.get("line_risk", {}).get("geojson", ""))
     roads_geojson = Path(outputs.get("transport", {}).get("roads_geojson", ""))
     hsr_geojson = Path(outputs.get("transport", {}).get("hsr_geojson", ""))
     road_lines_xy: List[Any] = []
@@ -1414,76 +2140,61 @@ def build_line_risk_geometries(
     c_road = 0
     c_hsr = 0
     c_hv_power = 0
-    high_road_types = {"motorway", "trunk", "primary"}
     south, north, west, east = route_bbox
     bbox_poly_wgs = Polygon([(west, south), (east, south), (east, north), (west, north), (west, south)])
     bbox_poly_xy = _to_xy_geometry(bbox_poly_wgs, fwd)
-    for feat in load_geojson_features(roads_geojson):
-        props = feat.get("properties") or {}
-        hwy = str(props.get("highway", "")).strip().lower()
-        if hwy not in high_road_types:
-            continue
-        try:
-            g = shape(feat.get("geometry") or {})
-        except Exception:
-            continue
-        g_xy = _to_xy_geometry(g, fwd)
-        if g_xy is None:
-            continue
-        if bbox_poly_xy is not None and (not g_xy.intersects(bbox_poly_xy)):
-            continue
-        road_lines_xy.append(g_xy)
-        c_road += 1
-    for feat in load_geojson_features(hsr_geojson):
-        try:
-            g = shape(feat.get("geometry") or {})
-        except Exception:
-            continue
-        g_xy = _to_xy_geometry(g, fwd)
-        if g_xy is None:
-            continue
-        if bbox_poly_xy is not None and (not g_xy.intersects(bbox_poly_xy)):
-            continue
-        hsr_lines_xy.append(g_xy)
-        c_hsr += 1
-
-    query = f"""
-[out:json][timeout:120];
-(
-  way({south},{west},{north},{east})[highway~"^(motorway|trunk|primary)$"];
-  way({south},{west},{north},{east})[railway=rail][highspeed=yes];
-  way({south},{west},{north},{east})[power~"^(line|minor_line)$"][voltage];
-);
-out geom tags;
-""".strip()
-    try:
-        data = run_overpass(query, timeout=120)
-    except Exception:
-        data = {"elements": []}
-    for el in data.get("elements", []):
-        tags = el.get("tags") or {}
-        coords = _element_coords_wgs(el)
-        if len(coords) < 2:
-            continue
-        g_wgs = LineString(coords)
-        g_xy = _to_xy_geometry(g_wgs, fwd)
-        if g_xy is None:
-            continue
-        hwy = str(tags.get("highway", "")).strip().lower()
-        railway = str(tags.get("railway", "")).strip().lower()
-        highspeed = str(tags.get("highspeed", "")).strip().lower()
-        power = str(tags.get("power", "")).strip().lower()
-        if hwy in high_road_types:
-            road_lines_xy.append(g_xy)
-            c_road += 1
-        elif railway == "rail" and highspeed in {"yes", "designated"}:
-            hsr_lines_xy.append(g_xy)
-            c_hsr += 1
-        elif power in {"line", "minor_line"}:
-            voltage_v = _max_voltage_v(tags.get("voltage"))
-            if voltage_v is not None and voltage_v >= HIGH_VOLTAGE_LINE_MIN_V:
+    if line_risk_geojson.exists():
+        for feat in load_geojson_features(line_risk_geojson):
+            props = feat.get("properties") or {}
+            risk_type = str(props.get("line_risk_type", "")).strip().lower()
+            try:
+                g = shape(feat.get("geometry") or {})
+            except Exception:
+                continue
+            g_xy = _to_xy_geometry(g, fwd)
+            if g_xy is None:
+                continue
+            if bbox_poly_xy is not None and (not g_xy.intersects(bbox_poly_xy)):
+                continue
+            if risk_type == "highway":
+                road_lines_xy.append(g_xy)
+                c_road += 1
+            elif risk_type == "hsr":
+                hsr_lines_xy.append(g_xy)
+                c_hsr += 1
+            elif risk_type == "high_voltage_power_line":
                 hv_power_lines_xy.append(g_xy)
                 c_hv_power += 1
+    else:
+        high_road_types = {"motorway", "trunk", "primary"}
+        for feat in load_geojson_features(roads_geojson):
+            props = feat.get("properties") or {}
+            hwy = str(props.get("highway", "")).strip().lower()
+            if hwy not in high_road_types:
+                continue
+            try:
+                g = shape(feat.get("geometry") or {})
+            except Exception:
+                continue
+            g_xy = _to_xy_geometry(g, fwd)
+            if g_xy is None:
+                continue
+            if bbox_poly_xy is not None and (not g_xy.intersects(bbox_poly_xy)):
+                continue
+            road_lines_xy.append(g_xy)
+            c_road += 1
+        for feat in load_geojson_features(hsr_geojson):
+            try:
+                g = shape(feat.get("geometry") or {})
+            except Exception:
+                continue
+            g_xy = _to_xy_geometry(g, fwd)
+            if g_xy is None:
+                continue
+            if bbox_poly_xy is not None and (not g_xy.intersects(bbox_poly_xy)):
+                continue
+            hsr_lines_xy.append(g_xy)
+            c_hsr += 1
 
     line_risk_geoms = (
         [g.buffer(35.0) for g in road_lines_xy]
@@ -2248,8 +2959,10 @@ def load_city_networks(
     summary: Dict[str, Any],
     route_bbox: Tuple[float, float, float, float],
 ) -> List[Dict[str, Any]]:
+    del route_bbox
     outputs = summary.get("outputs", {})
     roads_geojson = Path(outputs.get("transport", {}).get("roads_geojson", ""))
+    waterway_geojson = Path(outputs.get("hydro", {}).get("waterway_geojson", ""))
     roads_wgs: List[Dict[str, Any]] = []
     for feat in load_geojson_features(roads_geojson):
         geom = feat.get("geometry") or {}
@@ -2282,39 +2995,34 @@ def load_city_networks(
                             "name": name,
                         }
                     )
-    south, north, west, east = route_bbox
-    query = f"""
-[out:json][timeout:120];
-(
-  way({south},{west},{north},{east})[highway][highway!~"^(motorway|trunk|motorway_link|trunk_link)$"];
-  way({south},{west},{north},{east})[waterway~"^(river|canal|stream|ditch)$"];
-);
-out geom tags;
-""".strip()
-    try:
-        data = run_overpass(query, timeout=120)
-    except Exception:
-        return roads_wgs
-    for el in data.get("elements", []):
-        tags = el.get("tags") or {}
-        coords = _element_coords_wgs(el)
-        if len(coords) < 2:
-            continue
-        waterway = str(tags.get("waterway", "")).strip().lower()
-        ntype = "water" if waterway else "road"
-        hwy = str(tags.get("highway", "")).strip().lower()
-        if ntype == "road" and (not _is_usable_road_class(hwy)):
-            continue
-        tol = 0.00005 if ntype == "water" else 0.00008
-        coords2 = _simplify_coords_wgs(coords, tol_deg=tol)
-        roads_wgs.append(
-            {
-                "coords": coords2,
-                "network_type": ntype,
-                "highway": hwy,
-                "name": str(tags.get("name", "")).strip(),
-            }
-        )
+    for feat in load_geojson_features(waterway_geojson):
+        geom = feat.get("geometry") or {}
+        props = feat.get("properties") or {}
+        name = str(props.get("name", "")).strip()
+        if geom.get("type") == "LineString":
+            coords = geom.get("coordinates") or []
+            if len(coords) >= 2:
+                coords2 = _simplify_coords_wgs([(float(x), float(y)) for x, y in coords], tol_deg=0.00005)
+                roads_wgs.append(
+                    {
+                        "coords": coords2,
+                        "network_type": "water",
+                        "highway": "",
+                        "name": name,
+                    }
+                )
+        elif geom.get("type") == "MultiLineString":
+            for group in geom.get("coordinates") or []:
+                if len(group) >= 2:
+                    coords2 = _simplify_coords_wgs([(float(x), float(y)) for x, y in group], tol_deg=0.00005)
+                    roads_wgs.append(
+                        {
+                            "coords": coords2,
+                            "network_type": "water",
+                            "highway": "",
+                            "name": name,
+                        }
+                    )
     return roads_wgs
 
 
@@ -4684,6 +5392,202 @@ def flatten_small_altitude_staircases(
     return out
 
 
+def _index_at_or_before(cum_dist_m: List[float], dist_m: float) -> int:
+    if not cum_dist_m:
+        return 0
+    pos = bisect.bisect_right(cum_dist_m, float(dist_m)) - 1
+    return max(0, min(len(cum_dist_m) - 1, int(pos)))
+
+
+def _index_at_or_after(cum_dist_m: List[float], dist_m: float) -> int:
+    if not cum_dist_m:
+        return 0
+    pos = bisect.bisect_left(cum_dist_m, float(dist_m))
+    return max(0, min(len(cum_dist_m) - 1, int(pos)))
+
+
+def build_clustered_platform_altitude_target(
+    *,
+    z_lower: List[float],
+    z_upper: List[float],
+    z_min: List[float],
+    cum_dist_m: List[float],
+    endpoint_start_msl: float,
+    endpoint_end_msl: float,
+    climb_ratio: float,
+    descend_ratio: float,
+) -> Tuple[List[float], Dict[str, Any]]:
+    n = len(z_lower)
+    if n == 0:
+        return [], {
+            "strategy": "clustered_platform",
+            "high_zone_detected": False,
+            "cruise_reference_msl_m": 0.0,
+            "planned_climb_phase_m": 0.0,
+            "planned_descend_phase_m": 0.0,
+        }
+    if n == 1:
+        z0 = min(float(z_upper[0]), max(float(z_lower[0]), float(endpoint_end_msl)))
+        return [z0], {
+            "strategy": "clustered_platform",
+            "high_zone_detected": False,
+            "low_platform_msl_m": round(float(z0), 2),
+            "high_platform_msl_m": round(float(z0), 2),
+            "cruise_reference_msl_m": round(float(z0), 2),
+            "planned_climb_phase_m": 0.0,
+            "planned_descend_phase_m": 0.0,
+            "climb_start_km": 0.0,
+            "high_zone_start_km": 0.0,
+            "high_zone_end_km": 0.0,
+            "descent_start_km": 0.0,
+        }
+
+    low_quantile = _percentile(z_lower, 0.14)
+    low_seed = min(float(low_quantile), float(endpoint_start_msl) + float(ALT_CLUSTER_LOW_PLATFORM_CAP_RISE_M))
+    low_level = max(float(endpoint_start_msl), float(low_seed))
+    low_level = min(float(z_upper[0]), max(float(z_lower[0]), float(low_level)))
+    trigger_level = float(low_level) + float(ALT_CLUSTER_HIGH_TRIGGER_M)
+
+    raw_segments: List[Tuple[int, int]] = []
+    idx = 1
+    while idx < n - 1:
+        if float(z_min[idx]) >= trigger_level:
+            seg_start = idx
+            seg_peak = float(z_min[idx])
+            while idx + 1 < n - 1 and float(z_min[idx + 1]) >= trigger_level:
+                idx += 1
+                seg_peak = max(seg_peak, float(z_min[idx]))
+            seg_end = idx
+            seg_len_m = float(cum_dist_m[seg_end] - cum_dist_m[seg_start])
+            if seg_len_m >= ALT_CLUSTER_MIN_ZONE_LEN_M or (seg_peak - low_level) >= (ALT_CLUSTER_HIGH_TRIGGER_M + 4.0):
+                raw_segments.append((seg_start, seg_end))
+        idx += 1
+
+    merged_segments: List[Tuple[int, int]] = []
+    for seg_start, seg_end in raw_segments:
+        if not merged_segments:
+            merged_segments.append((seg_start, seg_end))
+            continue
+        prev_start, prev_end = merged_segments[-1]
+        gap_m = float(cum_dist_m[seg_start] - cum_dist_m[prev_end])
+        if gap_m <= ALT_CLUSTER_MERGE_GAP_M:
+            merged_segments[-1] = (prev_start, seg_end)
+        else:
+            merged_segments.append((seg_start, seg_end))
+
+    high_zone_found = False
+    high_zone_start_idx = n - 1
+    high_zone_end_idx = n - 1
+    route_len_m = max(1e-6, float(cum_dist_m[-1] - cum_dist_m[0]))
+    if merged_segments:
+        peak_idx = max(range(1, n - 1), key=lambda i: float(z_min[i]))
+        peak_level = float(z_min[peak_idx])
+        if peak_level >= trigger_level:
+            chosen = None
+            for seg_start, seg_end in merged_segments:
+                if seg_start <= peak_idx <= seg_end:
+                    chosen = (seg_start, seg_end)
+                    break
+            if chosen is None:
+                chosen = max(merged_segments, key=lambda se: max(float(z_min[k]) for k in range(se[0], se[1] + 1)))
+            if len(merged_segments) >= 2:
+                first_seg_start = merged_segments[0][0]
+                last_seg_end = merged_segments[-1][1]
+                multi_span_m = float(cum_dist_m[last_seg_end] - cum_dist_m[first_seg_start])
+                if multi_span_m <= route_len_m * ALT_CLUSTER_MULTI_WINDOW_MAX_RATIO:
+                    chosen = (first_seg_start, last_seg_end)
+            high_zone_start_idx, high_zone_end_idx = chosen
+            pad_start_m = max(float(cum_dist_m[0]), float(cum_dist_m[high_zone_start_idx]) - ALT_CLUSTER_ZONE_PAD_M)
+            pad_end_m = min(float(cum_dist_m[-1]), float(cum_dist_m[high_zone_end_idx]) + ALT_CLUSTER_ZONE_PAD_M)
+            high_zone_start_idx = _index_at_or_before(cum_dist_m, pad_start_m)
+            high_zone_end_idx = _index_at_or_after(cum_dist_m, pad_end_m)
+            high_zone_start_idx = max(1, min(n - 2, int(high_zone_start_idx)))
+            high_zone_end_idx = max(high_zone_start_idx, min(n - 2, int(high_zone_end_idx)))
+            high_zone_found = True
+
+    if high_zone_found:
+        high_level = max(float(low_level), max(float(z_lower[i]) for i in range(high_zone_start_idx, high_zone_end_idx + 1)))
+        high_level = float(math.ceil(high_level))
+        climb_need_m = max(0.0, high_level - float(low_level)) / max(1e-6, float(climb_ratio))
+        climb_start_m = max(
+            float(cum_dist_m[0]),
+            float(cum_dist_m[high_zone_start_idx]) - climb_need_m - ALT_CLUSTER_PRECLIMB_BUFFER_M,
+        )
+        climb_start_idx = min(high_zone_start_idx, _index_at_or_before(cum_dist_m, climb_start_m))
+        descend_need_m = max(0.0, high_level - float(endpoint_end_msl)) / max(1e-6, float(descend_ratio))
+        latest_descent_start_m = max(float(cum_dist_m[high_zone_end_idx]), float(cum_dist_m[-1]) - descend_need_m)
+        preferred_descent_start_m = float(cum_dist_m[high_zone_end_idx]) + ALT_CLUSTER_DESCENT_HOLD_M
+        descent_start_m = min(preferred_descent_start_m, latest_descent_start_m)
+        descent_start_idx = max(high_zone_end_idx, _index_at_or_after(cum_dist_m, descent_start_m))
+    else:
+        high_level = float(low_level)
+        climb_start_idx = 0
+        high_zone_start_idx = 0
+        high_zone_end_idx = 0
+        descend_need_m = max(0.0, high_level - float(endpoint_end_msl)) / max(1e-6, float(descend_ratio))
+        latest_descent_start_m = max(float(cum_dist_m[0]), float(cum_dist_m[-1]) - descend_need_m)
+        preferred_descent_start_m = max(float(cum_dist_m[0]), float(cum_dist_m[-1]) - max(descend_need_m, 260.0))
+        descent_start_m = min(preferred_descent_start_m, latest_descent_start_m)
+        descent_start_idx = max(0, _index_at_or_after(cum_dist_m, descent_start_m))
+
+    climb_start_idx = max(0, min(n - 1, int(climb_start_idx)))
+    descent_start_idx = max(high_zone_end_idx, min(n - 1, int(descent_start_idx)))
+    d_climb_start = float(cum_dist_m[climb_start_idx])
+    d_high_start = float(cum_dist_m[high_zone_start_idx])
+    d_descent_start = float(cum_dist_m[descent_start_idx])
+    d_end = float(cum_dist_m[-1])
+
+    future_floor: List[float] = [0.0] * n
+    running_future_floor = float(z_lower[-1])
+    for i in range(n - 1, -1, -1):
+        running_future_floor = max(running_future_floor, float(z_lower[i]))
+        future_floor[i] = float(running_future_floor)
+
+    z_desired: List[float] = [0.0] * n
+    for i in range(n):
+        d = float(cum_dist_m[i])
+        if high_zone_found and i <= high_zone_start_idx and high_zone_start_idx > climb_start_idx:
+            ds_total = max(1e-6, d_high_start - d_climb_start)
+            ratio = _clip01((d - d_climb_start) / ds_total)
+            target = float(low_level) + (float(high_level) - float(low_level)) * ratio
+        elif high_zone_found and i <= descent_start_idx:
+            target = float(high_level)
+        else:
+            ds_total = max(1e-6, d_end - d_descent_start)
+            ratio = _clip01((d - d_descent_start) / ds_total)
+            start_level = float(high_level) if high_zone_found else float(low_level)
+            target = start_level + (float(endpoint_end_msl) - start_level) * ratio
+            target = max(float(target), float(future_floor[i]))
+        z_desired[i] = min(float(z_upper[i]), max(float(z_lower[i]), float(target)))
+
+    if high_zone_found and high_zone_start_idx > 0:
+        pre_guard = float(z_desired[0])
+        for i in range(1, high_zone_start_idx + 1):
+            pre_guard = max(pre_guard, float(z_lower[i]), float(z_desired[i]))
+            z_desired[i] = min(float(z_upper[i]), max(float(z_lower[i]), float(pre_guard)))
+
+    z_desired[0] = min(float(z_upper[0]), max(float(z_lower[0]), float(endpoint_start_msl)))
+    z_desired[-1] = min(float(z_upper[-1]), max(float(z_lower[-1]), float(endpoint_end_msl)))
+
+    meta = {
+        "strategy": "clustered_platform",
+        "high_zone_detected": bool(high_zone_found),
+        "low_platform_msl_m": round(float(low_level), 2),
+        "high_platform_msl_m": round(float(high_level), 2),
+        "cluster_trigger_m": float(ALT_CLUSTER_HIGH_TRIGGER_M),
+        "cluster_merge_gap_m": float(ALT_CLUSTER_MERGE_GAP_M),
+        "cluster_zone_pad_m": float(ALT_CLUSTER_ZONE_PAD_M),
+        "planned_climb_phase_m": round(max(0.0, d_high_start - d_climb_start), 2) if high_zone_found else 0.0,
+        "planned_descend_phase_m": round(max(0.0, d_end - d_descent_start), 2),
+        "climb_start_km": round(d_climb_start / 1000.0, 3),
+        "high_zone_start_km": round(d_high_start / 1000.0, 3) if high_zone_found else None,
+        "high_zone_end_km": round(float(cum_dist_m[high_zone_end_idx]) / 1000.0, 3) if high_zone_found else None,
+        "descent_start_km": round(d_descent_start / 1000.0, 3),
+        "cruise_reference_msl_m": round(float(high_level if high_zone_found else low_level), 2),
+    }
+    return z_desired, meta
+
+
 def _point_to_segment_distance_m(
     point: Tuple[float, float],
     start: Tuple[float, float],
@@ -4833,7 +5737,11 @@ def compress_altitude_waypoints(
     dedup = set()
     for i in keep_idx:
         lon, lat = samples_wgs[i]
-        key = (round(lon, 8), round(lat, 8), round(float(z[i]), 3))
+        key = (
+            round(lon, COORD_OUTPUT_DECIMALS),
+            round(lat, COORD_OUTPUT_DECIMALS),
+            round(float(z[i]), 3),
+        )
         if key in dedup:
             continue
         dedup.add(key)
@@ -4941,8 +5849,8 @@ def plan_altitude_profile(
                 "obstacle_h_m": round(float(obstacle_vals[0]), 2),
                 "surface_clearance_m": round(clear0, 2),
                 "true_height_m": round(true0, 2),
-                "lon": round(float(lon), 8),
-                "lat": round(float(lat), 8),
+                "lon": round(float(lon), COORD_OUTPUT_DECIMALS),
+                "lat": round(float(lat), COORD_OUTPUT_DECIMALS),
             }
         ]
         meta_one = {
@@ -5040,56 +5948,19 @@ def plan_altitude_profile(
 
     climb_ratio = max(0.05, float(climb_ms) / max(0.5, float(speed_ms)))
     descend_ratio = max(0.05, float(descend_ms) / max(0.5, float(speed_ms)))
-    base_cruise_msl = _percentile(z_soft_cap_local, CRUISE_BASE_QUANTILE)
-    base_cruise_msl = max(base_cruise_msl, _percentile(z_lower, 0.18))
-    cruise_ref_msl = float(base_cruise_msl)
-    climb_need_dist = max(0.0, cruise_ref_msl - endpoint_start_msl) / climb_ratio
-    descend_need_dist = max(0.0, cruise_ref_msl - endpoint_end_msl) / descend_ratio
-
-    # Low-altitude-biased target:
-    # - keep MSL stable when possible
-    # - delay climb until the propagated hard lower envelope actually requires it
-    # - only descend from a plateau when there is a sustained lower-altitude opportunity
-    z_desired: List[float] = [0.0] * n
-    hold_msl = float(endpoint_start_msl)
-    z_desired[0] = hold_msl
-    for i in range(1, n - 1):
-        floor_i = float(z_lower[i])
-        climb_window_max_floor = floor_i
-        climb_window_peak_dist = 0.0
-        j = i
-        climb_limit_dist = float(cum_dist_m[i]) + LOW_ALT_CLIMB_LOOKAHEAD_M
-        while j + 1 < n and float(cum_dist_m[j + 1]) <= climb_limit_dist:
-            j += 1
-            floor_j = float(z_lower[j])
-            if floor_j > climb_window_max_floor + 1e-6:
-                climb_window_max_floor = floor_j
-                climb_window_peak_dist = float(cum_dist_m[j] - cum_dist_m[i])
-        hold_cap = float(z_soft_cap_local[i]) + CRUISE_MSL_HOLD_TOL_M
-        if climb_window_max_floor > hold_msl + 1e-6:
-            climb_need_dist = (climb_window_max_floor - hold_msl) / max(1e-6, climb_ratio)
-            if (
-                climb_window_max_floor - hold_msl >= LOW_ALT_CLIMB_COMMIT_M
-                and climb_window_peak_dist <= climb_need_dist + LOW_ALT_CLIMB_MARGIN_M
-            ):
-                hold_msl = climb_window_max_floor
-        if hold_msl < floor_i:
-            hold_msl = floor_i
-        elif hold_msl - floor_i <= LOW_ALT_STEP_HOLD_M:
-            hold_msl = max(hold_msl, floor_i)
-        else:
-            j = i
-            window_max_floor = floor_i
-            limit_dist = float(cum_dist_m[i]) + LOW_ALT_DESCENT_LOOKAHEAD_M
-            while j + 1 < n and float(cum_dist_m[j + 1]) <= limit_dist:
-                j += 1
-                window_max_floor = max(window_max_floor, float(z_lower[j]))
-            if hold_msl - window_max_floor >= LOW_ALT_DESCENT_COMMIT_M:
-                hold_msl = window_max_floor
-        if hold_msl > hold_cap:
-            hold_msl = min(hold_msl, float(z_soft_cap_local[i]) + CRUISE_SOFT_CAP_RELAX_M)
-        z_desired[i] = min(z_upper[i], max(z_lower[i], hold_msl))
-    z_desired[-1] = float(endpoint_end_msl)
+    z_desired, z_target_meta = build_clustered_platform_altitude_target(
+        z_lower=z_lower,
+        z_upper=z_upper,
+        z_min=z_min,
+        cum_dist_m=cum_dist_m,
+        endpoint_start_msl=float(endpoint_start_msl),
+        endpoint_end_msl=float(endpoint_end_msl),
+        climb_ratio=float(climb_ratio),
+        descend_ratio=float(descend_ratio),
+    )
+    cruise_ref_msl = float(z_target_meta.get("cruise_reference_msl_m", _percentile(z_desired, 0.55)))
+    climb_need_dist = float(z_target_meta.get("planned_climb_phase_m", 0.0))
+    descend_need_dist = float(z_target_meta.get("planned_descend_phase_m", 0.0))
 
     z = z_desired[:]
 
@@ -5260,8 +6131,8 @@ def plan_altitude_profile(
                 "obstacle_h_m": round(float(obstacle_vals[i]), 2),
                 "surface_clearance_m": round(max(0.0, float(z[i]) - float(top_surface_vals[i])), 2),
                 "true_height_m": round(max(0.0, float(z[i]) - float(terrain_msl_vals[i])), 2),
-                "lon": round(float(samples_wgs[i][0]), 8),
-                "lat": round(float(samples_wgs[i][1]), 8),
+                "lon": round(float(samples_wgs[i][0]), COORD_OUTPUT_DECIMALS),
+                "lat": round(float(samples_wgs[i][1]), COORD_OUTPUT_DECIMALS),
             }
         )
     meta = {
@@ -5269,6 +6140,17 @@ def plan_altitude_profile(
         "altitude_points": len(out_wgs_alt),
         "altitude_points_raw": len(samples_xy),
         "route_soft_cap_msl_m": round(float(max(z_pref_cap_local)), 2) if z_pref_cap_local else 0.0,
+        "vertical_profile_strategy": str(z_target_meta.get("strategy", "legacy")),
+        "profile_high_zone_detected": bool(z_target_meta.get("high_zone_detected", False)),
+        "profile_low_platform_msl_m": z_target_meta.get("low_platform_msl_m"),
+        "profile_high_platform_msl_m": z_target_meta.get("high_platform_msl_m"),
+        "profile_climb_start_km": z_target_meta.get("climb_start_km"),
+        "profile_high_zone_start_km": z_target_meta.get("high_zone_start_km"),
+        "profile_high_zone_end_km": z_target_meta.get("high_zone_end_km"),
+        "profile_descent_start_km": z_target_meta.get("descent_start_km"),
+        "profile_cluster_trigger_m": z_target_meta.get("cluster_trigger_m"),
+        "profile_cluster_merge_gap_m": z_target_meta.get("cluster_merge_gap_m"),
+        "profile_cluster_zone_pad_m": z_target_meta.get("cluster_zone_pad_m"),
         "cruise_soft_cap_relax_m": float(CRUISE_SOFT_CAP_RELAX_M),
         "cruise_msl_hold_tol_m": float(CRUISE_MSL_HOLD_TOL_M),
         "low_alt_descent_commit_m": float(LOW_ALT_DESCENT_COMMIT_M),
@@ -5321,7 +6203,7 @@ def plan_altitude_profile(
 
 
 def write_kml_absolute(path: Path, points_wgs_alt: List[Tuple[float, float, float]], name: str) -> None:
-    coords = " ".join([f"{lon:.6f},{lat:.6f},{alt:.2f}" for lon, lat, alt in points_wgs_alt])
+    coords = " ".join([f"{lon:.7f},{lat:.7f},{alt:.2f}" for lon, lat, alt in points_wgs_alt])
     text = f"""<?xml version="1.0" encoding="UTF-8"?>
 <kml xmlns="http://www.opengis.net/kml/2.2"><Document>
 <name>{name}</name>
@@ -5346,7 +6228,7 @@ def write_emergency_routes_kml(path: Path, routes: List[Dict[str, Any]], name: s
                 alt = float(p[2])
             except Exception:
                 continue
-            coords_tokens.append(f"{lon:.8f},{lat:.8f},{alt:.2f}")
+            coords_tokens.append(f"{lon:.7f},{lat:.7f},{alt:.2f}")
         if len(coords_tokens) < 2:
             continue
         coords = " ".join(coords_tokens)
@@ -8209,8 +9091,8 @@ def _build_preview_toolbar_script_html(
       const point = state.points[state.selectedIndex];
       if (!point) return;
       if (ui.index) ui.index.value = String(state.selectedIndex + 1);
-      if (ui.lon) ui.lon.value = point.lon.toFixed(6);
-      if (ui.lat) ui.lat.value = point.lat.toFixed(6);
+      if (ui.lon) ui.lon.value = point.lon.toFixed(7);
+      if (ui.lat) ui.lat.value = point.lat.toFixed(7);
       if (ui.alt) ui.alt.value = point.alt.toFixed(1);
       refreshPointSelectOptions();
       refreshSummary();
@@ -8372,7 +9254,7 @@ def _build_preview_toolbar_script_html(
       const routeName = safeName.replace(/\\.kml$/i, "");
       const coords = state.points
         .map(function (p) {
-          return p.lon.toFixed(6) + "," + p.lat.toFixed(6) + "," + p.alt.toFixed(2);
+          return p.lon.toFixed(7) + "," + p.lat.toFixed(7) + "," + p.alt.toFixed(2);
         })
         .join(" ");
       const kml = [
@@ -9401,7 +10283,7 @@ def main() -> None:
         help="Hard filter: max mean offset distance (meters) versus reference route.",
     )
     parser.add_argument("--name", default="auto_route", help="Output route base name.")
-    parser.add_argument("--city-zoom", default="8-14")
+    parser.add_argument("--city-zoom", default="8-14", help="Deprecated (kept for CLI compatibility).")
     parser.add_argument("--profile", choices=["fastest", "balanced", "safest"], default="balanced")
     parser.add_argument(
         "--select-candidate",
@@ -9739,15 +10621,6 @@ def main() -> None:
     if args.existing_routes_dir:
         existing_routes_wgs, existing_routes_load_stats = load_existing_route_kmls_from_dir(Path(args.existing_routes_dir))
 
-    ensure_city_data(root, args.city, args.city_zoom)
-    cache_dir = _find_city_cache_dir(root, args.city)
-    if cache_dir is None:
-        raise FileNotFoundError(f"City cache dir not found for: {args.city}")
-    summary_path = cache_dir / "download_summary.json"
-    if not summary_path.exists():
-        raise FileNotFoundError(f"download_summary.json missing for city: {args.city}")
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
-
     projector_points = [start_wgs, end_wgs] + reference_points_wgs
     for route in existing_routes_wgs:
         points = route.get("points_wgs_alt") or []
@@ -9775,6 +10648,7 @@ def main() -> None:
     bbox_points = reference_points_wgs if len(reference_points_wgs) >= 2 else [start_wgs, end_wgs]
     route_bbox = route_bbox_wgs(bbox_points, margin_m=4500.0)
     route_bbox_building = route_bbox_wgs(bbox_points, margin_m=2800.0)
+    summary_path, summary = prepare_bbox_runtime_summary(root, args.city, route_bbox)
     reference_line_xy = None
     reference_length_m = 0.0
     if len(reference_points_wgs) >= 2:
@@ -11204,8 +12078,14 @@ def main() -> None:
                         "segment_start_m": round(float(max(0.0, math.floor(anchor_dist_m / emergency_segment_len_m) * emergency_segment_len_m)), 2),
                         "segment_end_m": round(float(min(route_len_m, (math.floor(anchor_dist_m / emergency_segment_len_m) + 1.0) * emergency_segment_len_m)), 2),
                         "fork_distance_m": round(float(anchor_dist_m), 2),
-                        "fork_wgs": {"lon": round(float(fork_lon), 8), "lat": round(float(fork_lat), 8)},
-                        "landing_wgs": {"lon": round(float(landing_lon), 8), "lat": round(float(landing_lat), 8)},
+                        "fork_wgs": {
+                            "lon": round(float(fork_lon), COORD_OUTPUT_DECIMALS),
+                            "lat": round(float(fork_lat), COORD_OUTPUT_DECIMALS),
+                        },
+                        "landing_wgs": {
+                            "lon": round(float(landing_lon), COORD_OUTPUT_DECIMALS),
+                            "lat": round(float(landing_lat), COORD_OUTPUT_DECIMALS),
+                        },
                         "landing_type_label": str(cand.get("landing_type_label", "应急备降点")),
                         "safety_score": round(float(cand.get("safety_score", 0.0)), 4),
                         "branch_length_m": round(float(branch_len_m), 2),
@@ -11257,8 +12137,8 @@ def main() -> None:
             for item in sorted(bucket, key=lambda x: (float(x.get("objective_score", 999.0)), abs(float(x.get("fork_distance_m", 0.0)) - float(target_dist_m)))):
                 key = (
                     round(float(item.get("fork_distance_m", 0.0)), 1),
-                    round(float((item.get("landing_wgs", {}) or {}).get("lon", 0.0)), 5),
-                    round(float((item.get("landing_wgs", {}) or {}).get("lat", 0.0)), 5),
+                    round(float((item.get("landing_wgs", {}) or {}).get("lon", 0.0)), COORD_OUTPUT_DECIMALS),
+                    round(float((item.get("landing_wgs", {}) or {}).get("lat", 0.0)), COORD_OUTPUT_DECIMALS),
                 )
                 if key in dedupe:
                     continue

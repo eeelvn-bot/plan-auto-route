@@ -8,16 +8,39 @@ description: Build automatic urban UAV logistics routes from OD points with open
 Use this skill when you need a direct OD-to-route planner (not only KML post-refinement) for urban logistics UAV missions.
 This skill uses only the latest `plan_auto_route.py` algorithm (air-corridor + risk-aware graph search).
 Do not substitute older road-aligned refinement flows (for example `v72-route-planner`) when this skill is requested.
-For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
-`skills/plan-auto-route/scripts/plan_auto_route_v15_legacy.py`.
 
-## Dependency
+## Main Workflow (Current Default)
 
-- Required upstream data skill: `city-data-downloader`
-- Repository: https://github.com/eeelvn-bot/city-data-downloader
-- Recommended order:
-  1) run `city-data-downloader` to prepare city POI/landuse/hydro/population/transport layers
-  2) run `plan-auto-route` for OD planning and altitude profile generation
+`plan-auto-route` is now the mainline workflow and does **not** require `city-data-downloader` as an upstream prerequisite.
+
+### Confirmation Gate (Required Before Planning)
+
+When user starts a new planning request, run the interactive confirmation gateway first:
+
+```bash
+python3 skills/plan-auto-route/scripts/plan_auto_route_confirm.py \
+  --city "合肥市" \
+  --start-address "合肥市政务区天鹅湖万达广场" \
+  --end-address "合肥市包河区滨湖会展中心"
+```
+
+The gateway resolves address coordinates and asks the user to confirm:
+
+1. Start/end address coordinates.
+2. Whether to include emergency branch routes (default: enabled).
+3. Whether to load custom no-fly KML (default: disabled, with explicit loading instructions).
+4. Whether to enable existing-route avoidance (default: disabled; if enabled user must provide an existing-route KML directory).
+
+Only after confirmation should planning continue to `plan_auto_route.py`.
+
+Data is prepared inside planner runtime with a bbox-first strategy:
+1. Build route bbox from OD/reference route.
+2. Reuse overlapping local bbox cache under `output/auto_route_bbox_cache`.
+3. Query only uncovered bbox gaps from Overpass, then merge + de-duplicate.
+4. Use local WorldPop source (download on first use), then clip to current bbox.
+5. Keep civil-airport no-fly and custom no-fly as local file inputs.
+
+This keeps the planner self-contained while reducing repeated downloads across nearby routes.
 
 ## What it does
 
@@ -27,6 +50,7 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
    - Open-data hard no-fly zones:
      - Civil airports use CAAC dataset (`config/civil_airport_no_fly.geojson`, converted from 民航机场禁飞区.xls).
      - Military airport areas still come from OSM military tags.
+   - User-defined hard no-fly polygons from `--custom-no-fly-kml`.
    - Optional hard buffer around critical infrastructure.
    - Schools/kindergartens use hard avoidance buffers; universities are excluded from school-sensitive hard constraints.
 3. Optimizes a risk-aware objective:
@@ -65,7 +89,32 @@ For reproducibility comparisons, the frozen `opt_v15` baseline is kept at
    - Enforces hard filters on detour ratio and mean offset vs reference route.
    - Writes reference comparison metrics to candidate/meta outputs.
 
+## Runtime Data Sources
+
+- Overpass (bbox incremental):
+  - POI, landuse, roads, HSR, hydro, school/kindergarten, building/obstacle, infrastructure, line-risk, military/heli no-fly.
+- Local CAAC civil no-fly dataset:
+  - `skills/plan-auto-route/config/civil_airport_no_fly.geojson`.
+- Local custom no-fly:
+  - one or more `--custom-no-fly-kml`.
+- Population:
+  - WorldPop China raster (download on first run), clipped to current bbox.
+- Terrain:
+  - `--dem-tif` if provided; otherwise OpenTopoData SRTM endpoint.
+
 ## Command
+
+Recommended (interactive confirmation first):
+
+```bash
+python3 skills/plan-auto-route/scripts/plan_auto_route_confirm.py \
+  --city "合肥市" \
+  --start-address "合肥市政务区天鹅湖万达广场" \
+  --end-address "合肥市包河区滨湖会展中心" \
+  --name "hefei_auto_route_demo"
+```
+
+Direct planner command (for automation/non-interactive pipelines):
 
 ```bash
 python3 skills/plan-auto-route/scripts/plan_auto_route.py \
@@ -93,6 +142,7 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - `--select-candidate`: `safety_default | efficiency`
   - default is `safety_default` (main output route remains safety-first by default)
 - `--top-k`: number of alternatives to export (current phase exports best route + candidate summary)
+- `--city-zoom`: deprecated (kept only for CLI compatibility)
 - `--weight-sweep-levels`: deprecated in 2-candidate mode (accepted for compatibility but ignored)
 - `--pareto-select`: allow final selection from Pareto front (`distance_km`, `path_population_p90`, `vertical_energy_proxy_m`)
 - `--pareto-detour-limit-ratio`: optional override for max distance ratio allowed in Pareto switching
@@ -151,6 +201,9 @@ python3 skills/plan-auto-route/scripts/plan_auto_route.py \
 - Snapshot manifest: `output/auto_routes/snapshots/<name>_snapshot.json`
 - Optional layered review HTML:
   `output/full-workflow-v2-auto-route/<name>/<name>_map.html`
+- Runtime bbox cache for this run:
+  - `output/auto_route_bbox_cache/<city>_<bbox_hash>/download_summary.json`
+  - Includes merged local+incremental outputs for `poi/landuse/hydro/transport/line_risk/population`.
 
 When `--reference-kml` is enabled, outputs also include:
 - `reference_mode_enabled`
@@ -163,10 +216,14 @@ When `--reference-kml` is enabled, outputs also include:
 - This is phase-1 auto planner: OD automation + hard no-fly + risk-aware path + altitude envelope.
 - Civil-airport hard no-fly now depends on CAAC dataset geometry quality; military/heliport still depends on OSM completeness.
 - Overpass queries are cached in `output/overpass_cache` to improve reproducibility and reduce API jitter impact.
-- GIS city datasets are cache-first: planner checks local `output/city_data/<city>` completeness first, and only downloads missing data.
+- Route bbox datasets are cache-first: planner reuses overlapping bbox cache and only queries uncovered gaps.
+- Runtime summary now records cache reuse stats:
+  - `overlap_cache_count`
+  - `incremental_query_bbox_count`
+  - `incremental_query_bboxes`
 - To regenerate the civil-airport dataset from XLS: run `python3 skills/plan-auto-route/scripts/build_civil_airport_no_fly_geojson.py --xls /Users/leonzhao/dailywork/民航机场禁飞区.xls`.
 - For regulated missions, keep SORA/JARUS compliance checks as a separate gate.
-- Current refactor keeps script backup at `skills/plan-auto-route/scripts/plan_auto_route_pre_refactor_backup.py`.
+- Historical scripts and old docs are archived under `skills/plan-auto-route/archive/` and are not part of the runnable workflow.
 - Built-in Pareto policy file: `skills/plan-auto-route/config/pareto_policies.json`.
 
 ## Recommended Pareto Templates
