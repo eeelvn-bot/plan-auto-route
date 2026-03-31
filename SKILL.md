@@ -75,16 +75,19 @@ This keeps the planner self-contained while reducing repeated downloads across n
    - Cruise-first profile strategy: uses route-top reference to keep long flat segments, then descends near destination when feasible
    - KML waypoint compression: straight/no-turn segments avoid dense point injection; extra points are kept only when needed for altitude/safety constraints
 5. Outputs KML/HTML/meta and can optionally run `workflow_v2`.
-6. Exports two explicit route layers in HTML (no third "main route" layer):
-   - `安全优先（3D高度）` + `安全优先 缓冲区 100m`
-   - `效率优先（3D高度）` + `效率优先 缓冲区 100m`
-   Both are independently toggleable in LayerControl.
-7. Waypoint editor supports selecting the baseline route (`安全优先` / `效率优先`) before drag-editing and KML export.
-8. Vertical profile panel supports switching between `安全优先` and `效率优先` profile curves.
-9. Basemap high-zoom behavior is hardened:
+6. Exports merged route layers in HTML (no third "main route" layer):
+   - `安全优先（3D高度 + 缓冲区 100m）`
+   - `效率优先（3D高度 + 缓冲区 100m）`
+   Each layer toggles the route polyline and its 100m buffer together in LayerControl.
+7. Emergency branches and existing-route constraints are also merged by theme in LayerControl:
+   - Emergency route, emergency buffer, fork points, and emergency landing points share one layer.
+   - Existing-route centerline, avoidance corridor, and endpoint-relief zone share one layer.
+8. Waypoint editor supports selecting the baseline route (`安全优先` / `效率优先`) before drag-editing and KML export.
+9. Vertical profile panel supports switching between `安全优先` and `效率优先` profile curves.
+10. Basemap high-zoom behavior is hardened:
    - `普通地图` and `卫星影像` support high-zoom overzoom rendering.
    - `卫星注记` follows the same high-zoom cap so labels remain consistent.
-10. Supports minimal-change replanning with a reference route:
+11. Supports minimal-change replanning with a reference route:
    - Uses `--reference-kml` as baseline and adds deviation penalty in graph search.
    - Enforces hard filters on detour ratio and mean offset vs reference route.
    - Writes reference comparison metrics to candidate/meta outputs.

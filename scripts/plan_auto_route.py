@@ -449,6 +449,64 @@ def build_sweep_candidate_specs(
     return out
 
 
+def build_core_candidate_specs(
+    *,
+    safety_line_cross_weight: float = 1.15,
+    efficiency_line_cross_weight: float = 0.55,
+) -> List[CandidateSpec]:
+    return [
+        CandidateSpec(
+            id="safety_default",
+            label="安全优先",
+            profile_key="safest",
+            enable_water_connectors=False,
+            water_pref_factor=0.72,
+            allow_water_choice=True,
+            water_detour_limit=1.18,
+            min_water_share=0.08,
+            weight_scale={
+                "length": 0.92,
+                "population": 1.26,
+                "landuse": 1.22,
+                "infrastructure": 1.24,
+                "altitude": 1.12,
+                "turn": 1.08,
+                "crowd": 1.28,
+                "key_facility": 1.2,
+                "line_cross": max(0.05, float(safety_line_cross_weight)),
+            },
+            school_penalty_air=11.0,
+            school_penalty_ground=8.0,
+            enable_sensitive_hard_constraint=True,
+            enable_infra_hard_constraint=True,
+        ),
+        CandidateSpec(
+            id="efficiency",
+            label="效率优先",
+            profile_key="fastest",
+            enable_water_connectors=False,
+            water_pref_factor=1.0,
+            allow_water_choice=False,
+            water_detour_limit=1.35,
+            min_water_share=0.0,
+            weight_scale={
+                "length": 2.15,
+                "population": 0.26,
+                "landuse": 0.22,
+                "infrastructure": 0.27,
+                "altitude": 0.32,
+                "turn": 0.42,
+                "soft_no_fly": 0.5,
+                "crowd": 0.24,
+                "key_facility": 0.28,
+                "line_cross": max(0.05, float(efficiency_line_cross_weight)),
+            },
+            school_penalty_air=5.0,
+            school_penalty_ground=3.8,
+        ),
+    ]
+
+
 def _safe_float(value: Any, default: float = 0.0) -> float:
     try:
         return float(value)
@@ -3596,6 +3654,57 @@ def _segment_overlap_ratio(seg: LineString, zone_union) -> float:
         return 0.0
 
 
+def _geometry_overlap_ratio(geom, zone_union) -> float:
+    if geom is None or getattr(geom, "is_empty", True) or zone_union is None or zone_union.is_empty:
+        return 0.0
+    try:
+        if not geom.intersects(zone_union):
+            return 0.0
+        overlap = geom.intersection(zone_union)
+        if overlap.is_empty:
+            return 0.0
+        if getattr(geom, "area", 0.0) > 1e-6:
+            denom = max(1e-6, float(geom.area))
+            value = float(overlap.area)
+        else:
+            denom = max(1e-6, float(getattr(geom, "length", 0.0)))
+            value = float(getattr(overlap, "length", 0.0))
+        return max(0.0, min(1.0, value / denom))
+    except Exception:
+        return 0.0
+
+
+def _geometry_overlap_area_m2(geom, zone_union) -> float:
+    if geom is None or getattr(geom, "is_empty", True) or zone_union is None or zone_union.is_empty:
+        return 0.0
+    try:
+        if not geom.intersects(zone_union):
+            return 0.0
+        return max(0.0, float(geom.intersection(zone_union).area))
+    except Exception:
+        return 0.0
+
+
+def _line_risk_overlap_signals(
+    seg: LineString,
+    line_risk_union,
+    *,
+    route_buffer_m: float = ROUTE_BUFFER_M,
+) -> Dict[str, float]:
+    center_overlap_ratio = _segment_overlap_ratio(seg, line_risk_union)
+    buffer_overlap_ratio = 0.0
+    if route_buffer_m > 0.0:
+        try:
+            buffer_overlap_ratio = _geometry_overlap_ratio(seg.buffer(route_buffer_m), line_risk_union)
+        except Exception:
+            buffer_overlap_ratio = 0.0
+    return {
+        "center_overlap_ratio": center_overlap_ratio,
+        "buffer_overlap_ratio": buffer_overlap_ratio,
+        "effective_overlap_ratio": max(center_overlap_ratio, buffer_overlap_ratio),
+    }
+
+
 def _percentile(values: List[float], q: float) -> float:
     if not values:
         return 0.0
@@ -3840,7 +3949,12 @@ def build_navigation_graph(
             max(height_samples) if height_samples else 0.0
         )
         soft_overlap = _segment_overlap_ratio(seg, nofly_soft)
-        line_overlap = _segment_overlap_ratio(seg, line_risk_union)
+        line_risk_signals = _line_risk_overlap_signals(
+            seg,
+            line_risk_union,
+            route_buffer_m=ROUTE_BUFFER_M,
+        )
+        line_overlap = float(line_risk_signals.get("effective_overlap_ratio", 0.0))
         high_build_overlap = _segment_overlap_ratio(seg, high_building_union)
         school_overlap = _segment_overlap_ratio(seg, school_hard)
         crowd_pen = 0.5 * (sum(crowd_samples) / max(1, len(crowd_samples))) + 0.5 * _percentile(crowd_samples, 0.8)
@@ -3874,6 +3988,8 @@ def build_navigation_graph(
             "crowd_pen": crowd_pen,
             "key_pen": key_pen,
             "line_overlap": line_overlap,
+            "line_overlap_center": float(line_risk_signals.get("center_overlap_ratio", 0.0)),
+            "line_overlap_buffer": float(line_risk_signals.get("buffer_overlap_ratio", 0.0)),
             "high_building_overlap": high_build_overlap,
             "school_overlap": school_overlap,
             "pop_p90": pop_p90,
@@ -6624,11 +6740,15 @@ def build_data_quality_assessment(
         infra_local = _count_geoms_intersecting(infra_tree, seg_buf, infra_geoms, infra_id_map)
         school_local = _count_geoms_intersecting(school_tree, seg_buf, school_hard_zones_xy, school_id_map)
         line_overlap_local = 0.0
+        line_buffer_overlap_ratio_local = 0.0
+        line_buffer_overlap_area_local = 0.0
         if line_risk_union_xy is not None and (not line_risk_union_xy.is_empty):
             try:
                 line_overlap_local = float(seg_line.intersection(line_risk_union_xy).length)
             except Exception:
                 line_overlap_local = 0.0
+            line_buffer_overlap_ratio_local = _geometry_overlap_ratio(seg_buf, line_risk_union_xy)
+            line_buffer_overlap_area_local = _geometry_overlap_area_m2(seg_buf, line_risk_union_xy)
         seg_pop_avg, seg_pop_p90, seg_pop_max = _line_population_stats(seg_line, pop_sampler, inv)
 
         local_dem = _quality_layer_score(
@@ -6733,6 +6853,8 @@ def build_data_quality_assessment(
                 "critical_infra_in_buffer": int(infra_local),
                 "constraint_zone_hits": int(school_local + infra_local),
                 "line_risk_overlap_m": round(line_overlap_local, 2),
+                "line_risk_buffer_overlap_ratio": round(line_buffer_overlap_ratio_local, 4),
+                "line_risk_buffer_overlap_m2": round(line_buffer_overlap_area_local, 2),
                 "population_avg": round(seg_pop_avg, 2),
                 "population_p90": round(seg_pop_p90, 2),
                 "population_max": round(seg_pop_max, 2),
@@ -8676,10 +8798,10 @@ def _build_preview_toolbar_script_html(
         const layerName = String(entry[0] || "");
         const layer = entry[1];
         if (!layer) return;
-        if (hasAny(layerName, ["安全优先（3D高度）"])) {
+        if (hasAny(layerName, ["安全优先"])) {
           state.routeLayers.safety_default = layer;
           state.routeLayerWasVisible.safety_default = map.hasLayer(layer);
-        } else if (hasAny(layerName, ["效率优先（3D高度）"])) {
+        } else if (hasAny(layerName, ["效率优先"])) {
           state.routeLayers.efficiency = layer;
           state.routeLayerWasVisible.efficiency = map.hasLayer(layer);
         }
@@ -9646,16 +9768,14 @@ def write_preview_html(
         "safety_default": {
             "line_color": "#1565c0",
             "marker_color": "#0d47a1",
-            "layer_name": "安全优先（3D高度）",
-            "buffer_name": f"安全优先 缓冲区 {int(ROUTE_BUFFER_M)}m",
+            "layer_name": f"安全优先（3D高度 + 缓冲区 {int(ROUTE_BUFFER_M)}m）",
             "buffer_color": "#1e88e5",
             "fallback_label": "安全优先",
         },
         "efficiency": {
             "line_color": "#ef6c00",
             "marker_color": "#e65100",
-            "layer_name": "效率优先（3D高度）",
-            "buffer_name": f"效率优先 缓冲区 {int(ROUTE_BUFFER_M)}m",
+            "layer_name": f"效率优先（3D高度 + 缓冲区 {int(ROUTE_BUFFER_M)}m）",
             "buffer_color": "#fb8c00",
             "fallback_label": "效率优先",
         },
@@ -9724,19 +9844,16 @@ def write_preview_html(
                 fill_opacity=0.8,
                 tooltip=f"高度 {p['alt']:.1f} m",
             ).add_to(route_layer)
-        route_layer.add_to(m)
-
-        buf_layer = folium.FeatureGroup(name=style["buffer_name"], show=True)
         route_buffer_variant = cand.get("route_buffer_xy")
         if route_buffer_variant is not None and (not route_buffer_variant.is_empty):
             _add_polygon_layer(
-                buf_layer,
+                route_layer,
                 [route_buffer_variant],
                 color=style["buffer_color"],
                 fill_opacity=0.08,
                 max_items=1,
             )
-        buf_layer.add_to(m)
+        route_layer.add_to(m)
 
     if not route_variants_for_editor and len(route_points) >= 2:
         fallback_points = [
@@ -9744,7 +9861,7 @@ def write_preview_html(
             for lon, lat, alt in route_points
         ]
         route_variants_for_editor["safety_default"] = {"label": "安全优先", "points": fallback_points}
-        fallback_route = folium.FeatureGroup(name="安全优先（3D高度）", show=True)
+        fallback_route = folium.FeatureGroup(name=f"安全优先（3D高度 + 缓冲区 {int(ROUTE_BUFFER_M)}m）", show=True)
         folium.PolyLine(
             [(float(lat), float(lon)) for lon, lat, _ in route_points],
             color="#1565c0",
@@ -9752,17 +9869,12 @@ def write_preview_html(
             opacity=0.92,
             tooltip=f"安全优先 | 高度最小/最大 {min(alt for _, _, alt in route_points):.1f}/{max(alt for _, _, alt in route_points):.1f} m",
         ).add_to(fallback_route)
-        fallback_route.add_to(m)
-        fallback_buf = folium.FeatureGroup(name=f"安全优先 缓冲区 {int(ROUTE_BUFFER_M)}m", show=True)
         if route_buffer_xy is not None and (not route_buffer_xy.is_empty):
-            _add_polygon_layer(fallback_buf, [route_buffer_xy], color="#1e88e5", fill_opacity=0.08, max_items=1)
-        fallback_buf.add_to(m)
+            _add_polygon_layer(fallback_route, [route_buffer_xy], color="#1e88e5", fill_opacity=0.08, max_items=1)
+        fallback_route.add_to(m)
         route_buffer_variants_xy["safety_default"] = route_buffer_xy
 
-    emergency_branch_layer = folium.FeatureGroup(name="应急航线（备降）", show=True)
-    emergency_buffer_layer = folium.FeatureGroup(name=f"应急航线缓冲区 {int(ROUTE_BUFFER_M)}m", show=False)
-    emergency_fork_layer = folium.FeatureGroup(name="应急分叉点", show=False)
-    emergency_landing_layer = folium.FeatureGroup(name="应急备降点", show=True)
+    emergency_layer = folium.FeatureGroup(name=f"应急航线（备降，含缓冲区 {int(ROUTE_BUFFER_M)}m / 分叉点 / 备降点）", show=True)
     for item in emergency_routes or []:
         points = item.get("points_wgs_alt") or []
         coords = []
@@ -9784,11 +9896,11 @@ def write_preview_html(
                 weight=3,
                 opacity=0.92,
                 tooltip=tip,
-            ).add_to(emergency_branch_layer)
+            ).add_to(emergency_layer)
         branch_buffer_xy = item.get("branch_buffer_xy")
         if branch_buffer_xy is not None and (not getattr(branch_buffer_xy, "is_empty", True)):
             _add_polygon_layer(
-                emergency_buffer_layer,
+                emergency_layer,
                 [branch_buffer_xy],
                 color="#43a047",
                 fill_opacity=0.1,
@@ -9806,7 +9918,7 @@ def write_preview_html(
                 fill=True,
                 fill_opacity=0.95,
                 tooltip=f"应急分叉点 S{int(_safe_float(item.get('segment_index', -1), -1)) + 1}",
-            ).add_to(emergency_fork_layer)
+            ).add_to(emergency_layer)
         except Exception:
             pass
         try:
@@ -9819,13 +9931,10 @@ def write_preview_html(
                     f" | {str(item.get('landing_type_label', '备降点'))}"
                 ),
                 icon=folium.Icon(color="darkgreen", icon="plus", prefix="fa"),
-            ).add_to(emergency_landing_layer)
+            ).add_to(emergency_layer)
         except Exception:
             pass
-    emergency_branch_layer.add_to(m)
-    emergency_buffer_layer.add_to(m)
-    emergency_fork_layer.add_to(m)
-    emergency_landing_layer.add_to(m)
+    emergency_layer.add_to(m)
 
     dyn_grb_layer = folium.FeatureGroup(name="动态 GRB（AGL 1:1）", show=False)
     if dynamic_grb_xy is not None and (not dynamic_grb_xy.is_empty):
@@ -9888,35 +9997,29 @@ def write_preview_html(
     _add_polygon_layer(heli_soft_layer, heli_soft_nofly_polys_xy, color="#ef6c00", fill_opacity=0.16, max_items=260)
     heli_soft_layer.add_to(m)
 
-    existing_route_line_layer = folium.FeatureGroup(name="已有航线中心线", show=True)
+    existing_route_layer = folium.FeatureGroup(
+        name=(
+            f"已有航线（中心线 + 避让区 水平±{int(round(existing_route_horizontal_buffer_m))}m/"
+            f"垂直±{int(round(existing_route_vertical_buffer_m))}m + 起降点放松区 {int(round(existing_route_endpoint_relief_m))}m）"
+        ),
+        show=True,
+    )
     _add_line_layer(
-        existing_route_line_layer,
+        existing_route_layer,
         existing_route_lines_xy,
         color="#5e35b1",
         max_items=EXISTING_ROUTE_LAYER_MAX_ITEMS,
     )
-    existing_route_line_layer.add_to(m)
-
-    existing_route_corridor_layer = folium.FeatureGroup(
-        name=f"已有航线避让区（水平±{int(round(existing_route_horizontal_buffer_m))}m/垂直±{int(round(existing_route_vertical_buffer_m))}m）",
-        show=True,
-    )
     _add_polygon_layer(
-        existing_route_corridor_layer,
+        existing_route_layer,
         existing_route_corridors_xy,
         color="#00695c",
         fill_opacity=0.12,
         max_items=EXISTING_ROUTE_LAYER_MAX_ITEMS,
     )
-    existing_route_corridor_layer.add_to(m)
-
-    existing_route_relief_layer = folium.FeatureGroup(
-        name=f"起降点放松区（已有航线约束 {int(round(existing_route_endpoint_relief_m))}m）",
-        show=False,
-    )
     if existing_route_relief_union_xy is not None and (not existing_route_relief_union_xy.is_empty):
-        _add_polygon_layer(existing_route_relief_layer, [existing_route_relief_union_xy], color="#00acc1", fill_opacity=0.09, max_items=1)
-    existing_route_relief_layer.add_to(m)
+        _add_polygon_layer(existing_route_layer, [existing_route_relief_union_xy], color="#00acc1", fill_opacity=0.09, max_items=1)
+    existing_route_layer.add_to(m)
 
     landuse_layer = folium.FeatureGroup(name="土地利用", show=False)
     _add_landuse_layer(landuse_layer, landuse_geoms_xy, landuse_costs)
@@ -10134,27 +10237,17 @@ def write_preview_html(
             nofly_support,
             "本次未成功获取 Overpass 直升机场数据。",
         ),
-        _normalize_layer_key("已有航线中心线"): _compose_layer_status(
-            existing_route_source_ready,
-            _count_geom_hits(existing_route_corridors_xy, max_scan=EXISTING_ROUTE_LAYER_MAX_ITEMS) > 0,
-            nofly_score,
-            min(1.0, len(existing_route_lines_xy) / 6.0),
-            "本次未提供已有航线目录，或目录内无有效 KML 线要素。",
-        ),
         _normalize_layer_key(
-            f"已有航线避让区（水平±{int(round(existing_route_horizontal_buffer_m))}m/垂直±{int(round(existing_route_vertical_buffer_m))}m）"
+            f"已有航线（中心线 + 避让区 水平±{int(round(existing_route_horizontal_buffer_m))}m/"
+            f"垂直±{int(round(existing_route_vertical_buffer_m))}m + 起降点放松区 {int(round(existing_route_endpoint_relief_m))}m）"
         ): _compose_layer_status(
             existing_route_source_ready,
             _count_geom_hits(existing_route_corridors_xy, max_scan=EXISTING_ROUTE_LAYER_MAX_ITEMS) > 0,
             nofly_score,
-            min(1.0, len(existing_route_corridors_xy) / 6.0),
-            "本次未提供已有航线目录，或目录内无有效 KML 线要素。",
-        ),
-        _normalize_layer_key(f"起降点放松区（已有航线约束 {int(round(existing_route_endpoint_relief_m))}m）"): _compose_layer_status(
-            existing_route_source_ready,
-            existing_route_relief_union_xy is not None and (not existing_route_relief_union_xy.is_empty),
-            nofly_score,
-            1.0 if existing_route_relief_union_xy is not None and (not existing_route_relief_union_xy.is_empty) else 0.0,
+            min(
+                1.0,
+                max(len(existing_route_lines_xy), len(existing_route_corridors_xy)) / 6.0,
+            ),
             "未启用已有航线约束放松区。",
         ),
         _normalize_layer_key("土地利用"): _compose_layer_status(
@@ -10550,6 +10643,18 @@ def main() -> None:
     )
     parser.add_argument("--preferred-cruise-max-m", type=float, default=PREFERRED_CRUISE_ALT_M)
     parser.add_argument("--hard-ceiling-m", type=float, default=HARD_CEILING_ALT_M)
+    parser.add_argument(
+        "--safety-line-cross-weight",
+        type=float,
+        default=1.15,
+        help="Override line-risk penalty weight for the safety_default candidate.",
+    )
+    parser.add_argument(
+        "--efficiency-line-cross-weight",
+        type=float,
+        default=0.55,
+        help="Override line-risk penalty weight for the efficiency candidate.",
+    )
     parser.add_argument("--dem-tif", default="", help="Optional DEM GeoTIFF for terrain.")
     parser.add_argument("--opentopo-endpoint", default=DEFAULT_OPENTOPO_ENDPOINT)
     parser.add_argument("--out-dir", default="output/auto_routes")
@@ -11160,12 +11265,16 @@ def main() -> None:
         key_in_buf_local = _count_geoms_intersecting(key_tree, route_buffer_local, key_points_xy, key_id_map)
         infra_in_buf_local = _count_geoms_intersecting(infra_tree, route_buffer_local, infra_geoms, infra_id_map)
         line_overlap_local = 0.0
+        line_buffer_overlap_ratio_local = 0.0
+        line_buffer_overlap_area_local = 0.0
         high_build_overlap_local = 0.0
         if line_risk_union_xy is not None and (not line_risk_union_xy.is_empty):
             try:
                 line_overlap_local = float(route_line_local.intersection(line_risk_union_xy).length)
             except Exception:
                 line_overlap_local = 0.0
+            line_buffer_overlap_ratio_local = _geometry_overlap_ratio(route_buffer_local, line_risk_union_xy)
+            line_buffer_overlap_area_local = _geometry_overlap_area_m2(route_buffer_local, line_risk_union_xy)
         if high_building_union_xy is not None and (not high_building_union_xy.is_empty):
             try:
                 high_build_overlap_local = float(route_line_local.intersection(high_building_union_xy).length)
@@ -11198,62 +11307,17 @@ def main() -> None:
                 "key_facility_points_in_buffer": int(key_in_buf_local),
                 "critical_infra_geoms_in_buffer": int(infra_in_buf_local),
                 "line_risk_overlap_m": round(line_overlap_local, 2),
+                "line_risk_buffer_overlap_ratio": round(line_buffer_overlap_ratio_local, 4),
+                "line_risk_buffer_overlap_m2": round(line_buffer_overlap_area_local, 2),
                 "high_building_overlap_m": round(high_build_overlap_local, 2),
             },
             "graph_stats": graph_stats_local,
         }
 
-    core_candidate_specs = [
-        CandidateSpec(
-            id="safety_default",
-            label="安全优先",
-            profile_key="safest",
-            enable_water_connectors=False,
-            water_pref_factor=0.72,
-            allow_water_choice=True,
-            water_detour_limit=1.18,
-            min_water_share=0.08,
-            weight_scale={
-                "length": 0.92,
-                "population": 1.26,
-                "landuse": 1.22,
-                "infrastructure": 1.24,
-                "altitude": 1.12,
-                "turn": 1.08,
-                "crowd": 1.28,
-                "key_facility": 1.2,
-                "line_cross": 1.18,
-            },
-            school_penalty_air=11.0,
-            school_penalty_ground=8.0,
-            enable_sensitive_hard_constraint=True,
-            enable_infra_hard_constraint=True,
-        ),
-        CandidateSpec(
-            id="efficiency",
-            label="效率优先",
-            profile_key="fastest",
-            enable_water_connectors=False,
-            water_pref_factor=1.0,
-            allow_water_choice=False,
-            water_detour_limit=1.35,
-            min_water_share=0.0,
-            weight_scale={
-                "length": 2.15,
-                "population": 0.26,
-                "landuse": 0.22,
-                "infrastructure": 0.27,
-                "altitude": 0.32,
-                "turn": 0.42,
-                "soft_no_fly": 0.5,
-                "crowd": 0.24,
-                "key_facility": 0.28,
-                "line_cross": 0.3,
-            },
-            school_penalty_air=5.0,
-            school_penalty_ground=3.8,
-        ),
-    ]
+    core_candidate_specs = build_core_candidate_specs(
+        safety_line_cross_weight=float(args.safety_line_cross_weight),
+        efficiency_line_cross_weight=float(args.efficiency_line_cross_weight),
+    )
     sweep_candidate_specs: List[CandidateSpec] = []
     if int(args.weight_sweep_levels) > 0:
         print("[WARN] weight sweep is disabled in 2-candidate mode; ignoring --weight-sweep-levels.", flush=True)
@@ -11532,6 +11596,8 @@ def main() -> None:
     )
     infra_in_buffer = int(selected_candidate["buffer_metrics"]["critical_infra_geoms_in_buffer"])
     line_overlap_m = float(selected_candidate["buffer_metrics"]["line_risk_overlap_m"])
+    line_buffer_overlap_ratio = float(selected_candidate["buffer_metrics"].get("line_risk_buffer_overlap_ratio", 0.0))
+    line_buffer_overlap_m2 = float(selected_candidate["buffer_metrics"].get("line_risk_buffer_overlap_m2", 0.0))
     high_build_overlap_m = float(selected_candidate["buffer_metrics"]["high_building_overlap_m"])
     existing_route_conflict_samples = int(selected_candidate["buffer_metrics"].get("existing_route_3d_conflict_samples", 0))
     points_wgs_alt = selected_candidate["altitude_points_wgs_alt"]
@@ -12656,6 +12722,8 @@ def main() -> None:
             "key_facility_points_in_buffer": int(sensitive_in_buffer),
             "critical_infra_geoms_in_buffer": int(infra_in_buffer),
             "line_risk_overlap_m": round(line_overlap_m, 2),
+            "line_risk_buffer_overlap_ratio": round(line_buffer_overlap_ratio, 4),
+            "line_risk_buffer_overlap_m2": round(line_buffer_overlap_m2, 2),
             "high_building_overlap_m": round(high_build_overlap_m, 2),
             "existing_route_3d_conflict_samples": int(existing_route_conflict_samples),
             "dynamic_grb_area_m2": round(dynamic_grb_area_m2, 2),
