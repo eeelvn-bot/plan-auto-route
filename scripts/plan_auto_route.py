@@ -10338,6 +10338,1164 @@ def write_preview_html(
     path.write_text(html_text, encoding="utf-8")
 
 
+def build_route_output_paths(out_dir: Path, base_name: str) -> Dict[str, Path]:
+    return {
+        "kml": out_dir / f"{base_name}.kml",
+        "preview_html": out_dir / f"{base_name}.html",
+        "meta_json": out_dir / f"{base_name}_meta.json",
+        "candidates_json": out_dir / f"{base_name}_candidates.json",
+        "pareto_json": out_dir / f"{base_name}_pareto.json",
+        "coverage_json": out_dir / f"{base_name}_coverage.json",
+        "evidence_json": out_dir / f"{base_name}_evidence.json",
+        "cesium_json": out_dir / f"{base_name}_cesium.json",
+        "cesium_html": out_dir / f"{base_name}_3d.html",
+    }
+
+
+def _cesium_point(lon: Any, lat: Any, alt: Any = 0.0) -> Optional[Dict[str, float]]:
+    try:
+        lon_f = float(lon)
+        lat_f = float(lat)
+        alt_f = float(alt)
+    except Exception:
+        return None
+    if not (math.isfinite(lon_f) and math.isfinite(lat_f) and math.isfinite(alt_f)):
+        return None
+    return {"lon": lon_f, "lat": lat_f, "alt": alt_f}
+
+
+def _cesium_transform_geometry(geom_xy: Any, inv) -> Optional[Dict[str, Any]]:
+    if geom_xy is None or getattr(geom_xy, "is_empty", True):
+        return None
+    try:
+        geom_wgs = transform(inv, geom_xy)
+        if getattr(geom_wgs, "is_empty", True):
+            return None
+        if geom_wgs.geom_type not in {
+            "Point",
+            "MultiPoint",
+            "LineString",
+            "MultiLineString",
+            "Polygon",
+            "MultiPolygon",
+        }:
+            return None
+        return mapping(geom_wgs)
+    except Exception:
+        return None
+
+
+def _cesium_features_from_geoms(
+    geoms_xy: List[Any],
+    inv,
+    max_items: int,
+    properties: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    features: List[Dict[str, Any]] = []
+    for geom_xy in geoms_xy[: max(0, int(max_items))]:
+        geom = _cesium_transform_geometry(geom_xy, inv)
+        if not geom:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": dict(properties or {}),
+            }
+        )
+    return features
+
+
+def _cesium_layer(
+    layer_id: str,
+    label: str,
+    features: List[Dict[str, Any]],
+    color: str,
+    show: bool = False,
+) -> Dict[str, Any]:
+    return {
+        "id": layer_id,
+        "label": label,
+        "show": bool(show),
+        "color": color,
+        "features": features,
+    }
+
+
+def _cesium_features_from_geoms_with_properties(
+    geoms_xy: List[Any],
+    inv,
+    max_items: int,
+    properties_for_index,
+) -> List[Dict[str, Any]]:
+    features: List[Dict[str, Any]] = []
+    for idx, geom_xy in enumerate(geoms_xy[: max(0, int(max_items))]):
+        geom = _cesium_transform_geometry(geom_xy, inv)
+        if not geom:
+            continue
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": geom,
+                "properties": dict(properties_for_index(idx) or {}),
+            }
+        )
+    return features
+
+
+def build_cesium_payload(
+    *,
+    name: str,
+    candidate_routes_wgs: List[Dict[str, Any]],
+    route_points: List[Tuple[float, float, float]],
+    start_wgs: Tuple[float, float],
+    end_wgs: Tuple[float, float],
+    custom_no_fly_polys_xy: List[Any],
+    civil_airport_polys_xy: List[Any],
+    military_hard_nofly_polys_xy: List[Any],
+    heli_soft_nofly_polys_xy: List[Any],
+    existing_route_lines_xy: List[Any],
+    existing_route_corridors_xy: List[Any],
+    existing_route_relief_union_xy,
+    dynamic_grb_xy,
+    landuse_geoms_xy: List[Any],
+    landuse_costs: List[float],
+    all_building_polys_xy: List[Any],
+    high_building_polys_xy: List[Any],
+    crowd_points_xy: List[Any],
+    key_points_xy: List[Any],
+    infra_geoms_xy: List[Any],
+    high_road_lines_xy: List[Any],
+    hsr_lines_xy: List[Any],
+    hv_power_lines_xy: List[Any],
+    line_risk_union_xy,
+    school_hard_zones_xy: List[Any],
+    school_points_xy: List[Any],
+    population_points_wgs: List[Dict[str, float]],
+    emergency_routes: Optional[List[Dict[str, Any]]],
+    quality_variants: Dict[str, Dict[str, Any]],
+    layer_source_status: Optional[Dict[str, Any]],
+    inv,
+) -> Dict[str, Any]:
+    routes: List[Dict[str, Any]] = []
+    default_route_id = ""
+    for cand in candidate_routes_wgs:
+        cid = str(cand.get("id", f"route_{len(routes) + 1}"))
+        points = []
+        for raw in cand.get("alt_points") or []:
+            if len(raw) < 3:
+                continue
+            point = _cesium_point(raw[0], raw[1], raw[2])
+            if point:
+                points.append(point)
+        if len(points) < 2:
+            for raw in cand.get("coords") or []:
+                if len(raw) < 2:
+                    continue
+                point = _cesium_point(raw[1], raw[0], 60.0)
+                if point:
+                    points.append(point)
+        if len(points) < 2:
+            continue
+        selected = bool(cand.get("show", False))
+        if selected or not default_route_id:
+            default_route_id = cid
+        quality = quality_variants.get(cid, {}) if isinstance(quality_variants, dict) else {}
+        route_buffer_geojson = _cesium_transform_geometry(cand.get("route_buffer_xy"), inv)
+        routes.append(
+            {
+                "id": cid,
+                "label": str(cand.get("label", cid)),
+                "selected": selected,
+                "distance_km": round(_safe_float(cand.get("distance_km", 0.0), 0.0), 3),
+                "points": points,
+                "corridor": {
+                    "horizontal_half_width_m": float(EXISTING_ROUTE_HORIZONTAL_BUFFER_M),
+                    "vertical_half_height_m": float(EXISTING_ROUTE_VERTICAL_BUFFER_M),
+                    "source": "existing_route_avoidance_defaults",
+                },
+                "flight_envelope": {
+                    "horizontal_half_width_m": 10.0,
+                    "vertical_half_height_m": 6.0,
+                    "source": "display_default_inner_flight_volume",
+                },
+                "route_buffer_geojson": route_buffer_geojson,
+                "profile_samples": cand.get("profile_samples") or [],
+                "quality": quality,
+            }
+        )
+    if not routes and len(route_points) >= 2:
+        fallback_points = [
+            point
+            for point in (_cesium_point(lon, lat, alt) for lon, lat, alt in route_points)
+            if point
+        ]
+        if len(fallback_points) >= 2:
+            default_route_id = "safety_default"
+            routes.append(
+                {
+                    "id": "safety_default",
+                    "label": "安全优先",
+                    "selected": True,
+                    "distance_km": 0.0,
+                    "points": fallback_points,
+                    "corridor": {
+                        "horizontal_half_width_m": float(EXISTING_ROUTE_HORIZONTAL_BUFFER_M),
+                        "vertical_half_height_m": float(EXISTING_ROUTE_VERTICAL_BUFFER_M),
+                        "source": "existing_route_avoidance_defaults",
+                    },
+                    "flight_envelope": {
+                        "horizontal_half_width_m": 10.0,
+                        "vertical_half_height_m": 6.0,
+                        "source": "display_default_inner_flight_volume",
+                    },
+                    "route_buffer_geojson": None,
+                    "profile_samples": [],
+                    "quality": quality_variants.get("safety_default", {}) if isinstance(quality_variants, dict) else {},
+                }
+            )
+
+    landuse_features: List[Dict[str, Any]] = []
+    for idx, geom_xy in enumerate(landuse_geoms_xy[:2200]):
+        cost = _safe_float(landuse_costs[idx], 0.0) if idx < len(landuse_costs) else 0.0
+        geom = _cesium_transform_geometry(geom_xy, inv)
+        if geom:
+            landuse_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": geom,
+                    "properties": {"cost": cost},
+                }
+            )
+
+    line_risk_features = _cesium_features_from_geoms(high_road_lines_xy, inv, 800, {"kind": "highway"})
+    line_risk_features.extend(_cesium_features_from_geoms(hsr_lines_xy, inv, 500, {"kind": "hsr"}))
+    line_risk_features.extend(_cesium_features_from_geoms(hv_power_lines_xy, inv, 600, {"kind": "high_voltage"}))
+    if line_risk_union_xy is not None:
+        line_risk_features.extend(_cesium_features_from_geoms([line_risk_union_xy], inv, 1, {"kind": "buffer"}))
+
+    population_features: List[Dict[str, Any]] = []
+    for item in population_points_wgs[:3600]:
+        lon = _safe_float(item.get("lon", 0.0), 0.0)
+        lat = _safe_float(item.get("lat", 0.0), 0.0)
+        value = _safe_float(item.get("value", 0.0), 0.0)
+        if value <= 0.0:
+            continue
+        point = _cesium_point(lon, lat, 0.0)
+        if not point:
+            continue
+        population_features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [point["lon"], point["lat"]]},
+                "properties": {"value": value},
+            }
+        )
+
+    existing_route_features = _cesium_features_from_geoms(
+        existing_route_lines_xy,
+        inv,
+        EXISTING_ROUTE_LAYER_MAX_ITEMS,
+        {"kind": "centerline"},
+    )
+    existing_route_features.extend(
+        _cesium_features_from_geoms(
+            existing_route_corridors_xy,
+            inv,
+            EXISTING_ROUTE_LAYER_MAX_ITEMS,
+            {"kind": "corridor"},
+        )
+    )
+    if existing_route_relief_union_xy is not None:
+        existing_route_features.extend(
+            _cesium_features_from_geoms([existing_route_relief_union_xy], inv, 1, {"kind": "endpoint_relief"})
+        )
+
+    emergency_features: List[Dict[str, Any]] = []
+    for item in emergency_routes or []:
+        points = item.get("points_wgs_alt") or []
+        coords = []
+        for point in points:
+            if len(point) < 2:
+                continue
+            coords.append([float(point[0]), float(point[1])])
+        if len(coords) >= 2:
+            emergency_features.append(
+                {
+                    "type": "Feature",
+                    "geometry": {"type": "LineString", "coordinates": coords},
+                    "properties": {
+                        "segment_index": int(_safe_float(item.get("segment_index", -1), -1)),
+                        "branch_length_m": _safe_float(item.get("branch_length_m", 0.0), 0.0),
+                    },
+                }
+            )
+        branch_buffer_xy = item.get("branch_buffer_xy")
+        if branch_buffer_xy is not None:
+            emergency_features.extend(_cesium_features_from_geoms([branch_buffer_xy], inv, 1, {"kind": "buffer"}))
+
+    start_point = _cesium_point(start_wgs[0], start_wgs[1], 0.0)
+    end_point = _cesium_point(end_wgs[0], end_wgs[1], 0.0)
+    start_lon_lat = {"lon": float(start_wgs[0]), "lat": float(start_wgs[1])}
+    end_lon_lat = {"lon": float(end_wgs[0]), "lat": float(end_wgs[1])}
+    start_end_features = []
+    if start_point:
+        start_end_features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [start_point["lon"], start_point["lat"]]},
+                "properties": {"label": "起点"},
+            }
+        )
+    if end_point:
+        start_end_features.append(
+            {
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [end_point["lon"], end_point["lat"]]},
+                "properties": {"label": "终点"},
+            }
+        )
+
+    layers = [
+        _cesium_layer(
+            "custom_no_fly",
+            "自定义禁飞区（用户）",
+            _cesium_features_from_geoms(custom_no_fly_polys_xy, inv, 1200),
+            "#ad1457",
+            True,
+        ),
+        _cesium_layer(
+            "civil_airport_no_fly",
+            "民航机场禁飞区（CAAC）",
+            _cesium_features_from_geoms(civil_airport_polys_xy, inv, 260),
+            "#7b1fa2",
+            True,
+        ),
+        _cesium_layer(
+            "military_no_fly",
+            "军用机场禁飞区（硬约束）",
+            _cesium_features_from_geoms(military_hard_nofly_polys_xy, inv, 220),
+            "#d32f2f",
+            True,
+        ),
+        _cesium_layer(
+            "heli_soft_no_fly",
+            "直升机场避让区（软约束）",
+            _cesium_features_from_geoms(heli_soft_nofly_polys_xy, inv, 260),
+            "#ef6c00",
+            True,
+        ),
+        _cesium_layer("existing_routes", "已有航线", existing_route_features, "#5e35b1", True),
+        _cesium_layer(
+            "dynamic_grb",
+            "动态 GRB（AGL 1:1）",
+            _cesium_features_from_geoms([dynamic_grb_xy], inv, 1) if dynamic_grb_xy is not None else [],
+            "#26a69a",
+            False,
+        ),
+        _cesium_layer("population", "人口密度", population_features, "#d32f2f", False),
+        _cesium_layer("landuse", "土地利用", landuse_features, "#8bc34a", False),
+        _cesium_layer(
+            "all_buildings",
+            "全部建筑物",
+            _cesium_features_from_geoms(all_building_polys_xy, inv, 1200),
+            "#8d6e63",
+            False,
+        ),
+        _cesium_layer(
+            "high_buildings",
+            f"高层建筑（>={int(HIGH_BUILDING_THRESHOLD_M)}m）",
+            _cesium_features_from_geoms_with_properties(
+                high_building_polys_xy,
+                inv,
+                700,
+                lambda _idx: {"height_m": float(HIGH_BUILDING_THRESHOLD_M)},
+            ),
+            "#ef6c00",
+            False,
+        ),
+        _cesium_layer(
+            "school_zones",
+            "学校/幼儿园避让区",
+            _cesium_features_from_geoms(school_hard_zones_xy, inv, 600)
+            + _cesium_features_from_geoms(school_points_xy, inv, 800),
+            "#c62828",
+            False,
+        ),
+        _cesium_layer(
+            "crowd_points",
+            "人群聚集 POI",
+            _cesium_features_from_geoms(crowd_points_xy, inv, 1200),
+            "#ad1457",
+            False,
+        ),
+        _cesium_layer(
+            "key_points",
+            "敏感设施 POI",
+            _cesium_features_from_geoms(key_points_xy, inv, 800),
+            "#6a1b9a",
+            False,
+        ),
+        _cesium_layer(
+            "infra",
+            "关键基础设施",
+            _cesium_features_from_geoms(infra_geoms_xy, inv, 500),
+            "#455a64",
+            False,
+        ),
+        _cesium_layer("line_risk", "线性风险（高速/高铁/高压电力线）", line_risk_features, "#b71c1c", False),
+        _cesium_layer("emergency_routes", "应急航线（备降）", emergency_features, "#2e7d32", True),
+        _cesium_layer("start_end", "起点/终点", start_end_features, "#00a152", True),
+    ]
+
+    payload = {
+        "schema_version": "plan-auto-route-cesium-v1",
+        "version": "cesium_mvp_v1",
+        "algorithm_version": ALGORITHM_VERSION,
+        "name": str(name),
+        "crs": "EPSG:4326",
+        "units": {"horizontal": "degrees", "distance": "m", "altitude": "m"},
+        "altitude_reference": "MSL",
+        "start_wgs84": start_lon_lat,
+        "end_wgs84": end_lon_lat,
+        "default_route_id": default_route_id,
+        "routes": routes,
+        "layers": layers,
+        "layer_source_status": layer_source_status or {},
+        "metrics": {
+            "route_count": len(routes),
+            "layer_count": len(layers),
+            "feature_count": sum(len(layer.get("features", [])) for layer in layers),
+        },
+    }
+    return payload
+
+
+def write_cesium_viewer_html(path: Path, json_path: Path, name: str) -> None:
+    json_ref = json_path.name
+    title = html.escape(str(name))
+    json_ref_js = json.dumps(json_ref, ensure_ascii=False)
+    html_text = f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title} 3D Cesium Viewer</title>
+  <script src="https://cdn.jsdelivr.net/npm/cesium@1.127.0/Build/Cesium/Cesium.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/cesium@1.127.0/Build/Cesium/Widgets/widgets.css" rel="stylesheet" />
+  <style>
+    html, body, #cesiumContainer {{
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }}
+    .panel {{
+      position: absolute;
+      top: 12px;
+      left: 12px;
+      z-index: 2;
+      width: min(360px, calc(100vw - 24px));
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+      background: rgba(255, 255, 255, 0.94);
+      border: 1px solid rgba(20, 35, 55, 0.18);
+      border-radius: 8px;
+      box-shadow: 0 12px 28px rgba(0, 0, 0, 0.22);
+      color: #172033;
+    }}
+    .panel h1 {{
+      font-size: 15px;
+      margin: 0;
+      padding: 12px 12px 8px;
+      border-bottom: 1px solid rgba(20, 35, 55, 0.12);
+    }}
+    .panel-section {{
+      padding: 10px 12px;
+      border-bottom: 1px solid rgba(20, 35, 55, 0.1);
+    }}
+    .row {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      min-height: 28px;
+      font-size: 13px;
+    }}
+    .row label {{
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }}
+    .row span {{
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }}
+    button {{
+      border: 1px solid rgba(20, 35, 55, 0.18);
+      background: #fff;
+      border-radius: 6px;
+      padding: 5px 8px;
+      font-size: 12px;
+      cursor: pointer;
+    }}
+    .basemap-buttons {{
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 6px;
+      margin-top: 8px;
+    }}
+    .basemap-buttons button {{
+      min-width: 0;
+      white-space: nowrap;
+    }}
+    .basemap-buttons button.active {{
+      background: #172033;
+      color: #fff;
+      border-color: #172033;
+    }}
+    .terrain-buttons {{
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 6px;
+      margin-top: 8px;
+    }}
+    .terrain-buttons button.active {{
+      background: #0f766e;
+      color: #fff;
+      border-color: #0f766e;
+    }}
+    .metric-grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
+      font-size: 12px;
+    }}
+    .metric {{
+      background: #f5f7fa;
+      border-radius: 6px;
+      padding: 7px;
+    }}
+    .metric strong {{
+      display: block;
+      font-size: 14px;
+      margin-top: 2px;
+    }}
+    .profile-chart {{
+      width: 100%;
+      height: auto;
+      margin-top: 8px;
+      display: block;
+      background: #f7fafc;
+      border: 1px solid rgba(20, 35, 55, 0.1);
+      border-radius: 6px;
+    }}
+    .profile-legend {{
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 6px;
+      color: #4a5568;
+      font-size: 11px;
+    }}
+    .profile-legend span {{
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+    }}
+    .profile-swatch {{
+      width: 14px;
+      height: 3px;
+      border-radius: 2px;
+      display: inline-block;
+    }}
+    .profile-note {{
+      margin-top: 6px;
+      color: #4a5568;
+      font-size: 12px;
+      line-height: 1.4;
+    }}
+    .profile-hit {{
+      cursor: crosshair;
+    }}
+    .profile-hit.is-active {{
+      fill: #f97316;
+      stroke: #111827;
+      stroke-width: 2;
+    }}
+    .status {{
+      font-size: 12px;
+      line-height: 1.45;
+      color: #4a5568;
+    }}
+    .status.error {{
+      color: #9b1c1c;
+    }}
+  </style>
+</head>
+<body>
+  <div id="cesiumContainer"></div>
+  <div class="panel">
+    <h1>{title} 3D 只读查看</h1>
+    <div class="panel-section">
+      <div id="status" class="status">正在加载 {html.escape(json_ref)}...</div>
+    </div>
+    <div class="panel-section">
+      <strong>底图</strong>
+      <div id="basemaps" class="basemap-buttons"></div>
+    </div>
+    <div class="panel-section">
+      <strong>地形</strong>
+      <div id="terrainModes" class="terrain-buttons"></div>
+    </div>
+    <div class="panel-section">
+      <div id="metrics" class="metric-grid"></div>
+    </div>
+    <div class="panel-section" id="routes"></div>
+    <div class="panel-section" id="profile"></div>
+    <div class="panel-section" id="layers"></div>
+  </div>
+  <script>
+    const payloadUrl = {json_ref_js};
+    const viewer = new Cesium.Viewer("cesiumContainer", {{
+      animation: false,
+      timeline: false,
+      baseLayerPicker: false,
+      imageryProvider: new Cesium.UrlTemplateImageryProvider({{
+        url: "https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",
+        credit: "OpenStreetMap contributors"
+      }}),
+      geocoder: false,
+      homeButton: true,
+      navigationHelpButton: false,
+      sceneModePicker: true,
+      terrainProvider: new Cesium.EllipsoidTerrainProvider()
+    }});
+    viewer.scene.globe.depthTestAgainstTerrain = false;
+    const statusEl = document.getElementById("status");
+    const basemapsEl = document.getElementById("basemaps");
+    const terrainModesEl = document.getElementById("terrainModes");
+    const metricsEl = document.getElementById("metrics");
+    const routesEl = document.getElementById("routes");
+    const profileEl = document.getElementById("profile");
+    const layersEl = document.getElementById("layers");
+    const routeEntities = new Map();
+    const layerEntities = new Map();
+    let loadedPayload = null;
+    let profileMarkerEntity = null;
+    let activeTerrainId = "arcgis";
+    const basemaps = [
+      {{
+        id: "normal",
+        label: "普通地图",
+        layers: [
+          {{
+            url: "https://tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png",
+            credit: "OpenStreetMap contributors"
+          }}
+        ]
+      }},
+      {{
+        id: "satellite",
+        label: "卫星影像",
+        layers: [
+          {{
+            url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
+            credit: "Esri World Imagery"
+          }}
+        ]
+      }},
+      {{
+        id: "satellite_labels",
+        label: "卫星注记",
+        layers: [
+          {{
+            url: "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}",
+            credit: "Esri World Imagery"
+          }},
+          {{
+            url: "https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}",
+            credit: "Esri Reference"
+          }}
+        ]
+      }}
+    ];
+    let activeBasemapId = "normal";
+    const terrainModes = [
+      {{ id: "arcgis", label: "真实地形" }},
+      {{ id: "ellipsoid", label: "平面地形" }}
+    ];
+
+    function setStatus(text, isError) {{
+      statusEl.textContent = text;
+      statusEl.className = isError ? "status error" : "status";
+    }}
+
+    function colorFromHex(hex, alpha) {{
+      return Cesium.Color.fromCssColorString(hex || "#3388ff").withAlpha(alpha);
+    }}
+
+    function applyBasemap(id) {{
+      const selected = basemaps.find((item) => item.id === id) || basemaps[0];
+      activeBasemapId = selected.id;
+      viewer.imageryLayers.removeAll();
+      selected.layers.forEach((layer) => {{
+        viewer.imageryLayers.addImageryProvider(new Cesium.UrlTemplateImageryProvider({{
+          url: layer.url,
+          credit: layer.credit
+        }}));
+      }});
+      Array.from(basemapsEl.querySelectorAll("button")).forEach((button) => {{
+        button.classList.toggle("active", button.dataset.basemapId === activeBasemapId);
+      }});
+    }}
+
+    function renderBasemaps() {{
+      basemapsEl.innerHTML = "";
+      basemaps.forEach((item) => {{
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.basemapId = item.id;
+        button.textContent = item.label;
+        button.className = item.id === activeBasemapId ? "active" : "";
+        button.addEventListener("click", () => applyBasemap(item.id));
+        basemapsEl.appendChild(button);
+      }});
+    }}
+
+    async function applyTerrain(id) {{
+      activeTerrainId = id;
+      try {{
+        if (id === "arcgis") {{
+          if (!Cesium.ArcGISTiledElevationTerrainProvider || !Cesium.ArcGISTiledElevationTerrainProvider.fromUrl) {{
+            throw new Error("当前 Cesium 版本不支持 ArcGIS 地形提供器");
+          }}
+          const provider = await Cesium.ArcGISTiledElevationTerrainProvider.fromUrl(
+            "https://elevation3d.arcgis.com/arcgis/rest/services/WorldElevation3D/Terrain3D/ImageServer"
+          );
+          viewer.terrainProvider = provider;
+          viewer.scene.globe.depthTestAgainstTerrain = true;
+          viewer.scene.globe.enableLighting = true;
+          setStatus(`已加载 ${{loadedPayload?.name || ""}}，真实地形已开启。`, false);
+        }} else {{
+          viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+          viewer.scene.globe.depthTestAgainstTerrain = false;
+          viewer.scene.globe.enableLighting = false;
+          setStatus(`已加载 ${{loadedPayload?.name || ""}}，当前为平面地形。`, false);
+        }}
+      }} catch (error) {{
+        activeTerrainId = "ellipsoid";
+        viewer.terrainProvider = new Cesium.EllipsoidTerrainProvider();
+        viewer.scene.globe.depthTestAgainstTerrain = false;
+        viewer.scene.globe.enableLighting = false;
+        setStatus(`真实地形加载失败，已回退到平面地形：${{error.message}}`, true);
+      }}
+      Array.from(terrainModesEl.querySelectorAll("button")).forEach((button) => {{
+        button.classList.toggle("active", button.dataset.terrainId === activeTerrainId);
+      }});
+    }}
+
+    function renderTerrainModes() {{
+      terrainModesEl.innerHTML = "";
+      terrainModes.forEach((item) => {{
+        const button = document.createElement("button");
+        button.type = "button";
+        button.dataset.terrainId = item.id;
+        button.textContent = item.label;
+        button.className = item.id === activeTerrainId ? "active" : "";
+        button.addEventListener("click", () => applyTerrain(item.id));
+        terrainModesEl.appendChild(button);
+      }});
+    }}
+
+    function routePositions(points) {{
+      const values = [];
+      (points || []).forEach((point) => {{
+        values.push(Number(point.lon), Number(point.lat), Number(point.alt || 0));
+      }});
+      return Cesium.Cartesian3.fromDegreesArrayHeights(values);
+    }}
+
+    function addRouteCorridor(route, color, entities) {{
+      const corridor = route.corridor || {{}};
+      const halfWidthM = Number(corridor.horizontal_half_width_m || 0);
+      const halfHeightM = Number(corridor.vertical_half_height_m || 0);
+      const flightEnvelope = route.flight_envelope || {{}};
+      const flightHalfWidthM = Number(flightEnvelope.horizontal_half_width_m || Math.max(5, halfWidthM / 3));
+      const flightHalfHeightM = Number(flightEnvelope.vertical_half_height_m || Math.max(3, halfHeightM / 3));
+      const points = route.points || [];
+      if (points.length < 2 || halfWidthM <= 0 || halfHeightM <= 0) return;
+      const corridorSpecs = [
+        {{
+          label: "保护外廓",
+          halfWidthM,
+          halfHeightM,
+          alpha: 0.12,
+          color: color.withAlpha(0.12)
+        }},
+        {{
+          label: "飞行包络",
+          halfWidthM: Math.min(halfWidthM, Math.max(1, flightHalfWidthM)),
+          halfHeightM: Math.min(halfHeightM, Math.max(1, flightHalfHeightM)),
+          alpha: 0.28,
+          color: Cesium.Color.WHITE.withAlpha(0.28)
+        }}
+      ];
+      for (let idx = 0; idx < points.length - 1; idx += 1) {{
+        const p0 = points[idx];
+        const p1 = points[idx + 1];
+        const lon0 = Number(p0.lon);
+        const lat0 = Number(p0.lat);
+        const lon1 = Number(p1.lon);
+        const lat1 = Number(p1.lat);
+        const alt0 = Number(p0.alt || 0);
+        const alt1 = Number(p1.alt || 0);
+        if (![lon0, lat0, lon1, lat1, alt0, alt1].every(Number.isFinite)) continue;
+        const centerAlt = (alt0 + alt1) / 2;
+        corridorSpecs.forEach((spec) => {{
+          const lowerAlt = Math.max(0, centerAlt - spec.halfHeightM);
+          const upperAlt = Math.max(lowerAlt + 1, centerAlt + spec.halfHeightM);
+          entities.push(viewer.entities.add({{
+            name: `${{route.label || route.id}} ${{spec.label}} 水平±${{spec.halfWidthM.toFixed(0)}}m 垂直±${{spec.halfHeightM.toFixed(0)}}m`,
+            corridor: {{
+              positions: Cesium.Cartesian3.fromDegreesArray([lon0, lat0, lon1, lat1]),
+              width: Math.max(1, spec.halfWidthM * 2),
+              height: upperAlt,
+              extrudedHeight: lowerAlt,
+              cornerType: Cesium.CornerType.ROUNDED,
+              material: spec.color,
+              outline: false
+            }}
+          }}));
+        }});
+      }}
+    }}
+
+    function addRoute(route) {{
+      const positions = routePositions(route.points);
+      if (positions.length < 2) return [];
+      const color = route.id === "efficiency" ? Cesium.Color.ORANGE : Cesium.Color.DODGERBLUE;
+      const entities = [];
+      addRouteCorridor(route, color, entities);
+      entities.push(viewer.entities.add({{
+        name: route.label || route.id,
+        polyline: {{
+          positions,
+          width: route.selected ? 5 : 3,
+          material: color.withAlpha(route.selected ? 0.95 : 0.65),
+          clampToGround: false
+        }}
+      }}));
+      (route.points || []).forEach((point, idx) => {{
+        if (idx % Math.max(1, Math.floor(route.points.length / 80)) !== 0) return;
+        entities.push(viewer.entities.add({{
+          name: `${{route.label || route.id}} 高度 ${{Number(point.alt || 0).toFixed(1)}}m`,
+          position: Cesium.Cartesian3.fromDegrees(Number(point.lon), Number(point.lat), Number(point.alt || 0)),
+          point: {{ pixelSize: 5, color, outlineColor: Cesium.Color.WHITE, outlineWidth: 1 }}
+        }}));
+      }});
+      if (route.route_buffer_geojson) {{
+        const bufferLayer = {{
+          label: `${{route.label || route.id}} 缓冲区`,
+          color: route.id === "efficiency" ? "#fb8c00" : "#1e88e5"
+        }};
+        entities.push(...flattenEntities(addFeature(bufferLayer, {{
+          geometry: route.route_buffer_geojson,
+          properties: {{}}
+        }})));
+      }}
+      routeEntities.set(route.id, entities);
+      setEntityGroupVisible(entities, !!route.selected);
+    }}
+
+    function polygonHierarchy(coords) {{
+      if (!coords || !coords[0]) return null;
+      return Cesium.Cartesian3.fromDegreesArray(coords[0].flat());
+    }}
+
+    function addFeature(layer, feature) {{
+      const geom = feature.geometry || {{}};
+      const color = colorFromHex(layer.color, 0.42);
+      if (geom.type === "Point") {{
+        const coords = geom.coordinates || [];
+        return viewer.entities.add({{
+          name: layer.label,
+          position: Cesium.Cartesian3.fromDegrees(Number(coords[0]), Number(coords[1]), 0),
+          point: {{ pixelSize: 7, color: colorFromHex(layer.color, 0.9), outlineColor: Cesium.Color.WHITE, outlineWidth: 1 }}
+        }});
+      }}
+      if (geom.type === "LineString") {{
+        return viewer.entities.add({{
+          name: layer.label,
+          polyline: {{
+            positions: Cesium.Cartesian3.fromDegreesArray((geom.coordinates || []).flat()),
+            width: 2,
+            material: colorFromHex(layer.color, 0.82),
+            clampToGround: true
+          }}
+        }});
+      }}
+      if (geom.type === "MultiLineString") {{
+        return (geom.coordinates || []).map((line) => addFeature(layer, {{ geometry: {{ type: "LineString", coordinates: line }} }}));
+      }}
+      if (geom.type === "Polygon") {{
+        const hierarchy = polygonHierarchy(geom.coordinates);
+        if (!hierarchy) return null;
+        const heightM = Number(feature.properties && feature.properties.height_m);
+        return viewer.entities.add({{
+          name: layer.label,
+          polygon: {{
+            hierarchy,
+            material: color,
+            outline: true,
+            outlineColor: colorFromHex(layer.color, 0.85),
+            height: Number.isFinite(heightM) && heightM > 0 ? 0 : undefined,
+            extrudedHeight: Number.isFinite(heightM) && heightM > 0 ? heightM : undefined
+          }}
+        }});
+      }}
+      if (geom.type === "MultiPolygon") {{
+        return (geom.coordinates || []).map((poly) => addFeature(layer, {{ geometry: {{ type: "Polygon", coordinates: poly }} }}));
+      }}
+      return null;
+    }}
+
+    function flattenEntities(value) {{
+      if (!value) return [];
+      return Array.isArray(value) ? value.flatMap(flattenEntities) : [value];
+    }}
+
+    function setEntityGroupVisible(entities, visible) {{
+      (entities || []).forEach((entity) => {{ entity.show = visible; }});
+    }}
+
+    function addProfileMarker(route, sample, idx) {{
+      const point = (route.points || [])[idx] || {{}};
+      const lon = Number(sample.lon ?? point.lon);
+      const lat = Number(sample.lat ?? point.lat);
+      const alt = firstFinite(sample, ["route_alt_msl_m", "alt_m"]);
+      if (![lon, lat, alt].every(Number.isFinite)) return null;
+      const position = Cesium.Cartesian3.fromDegrees(lon, lat, alt);
+      const text = `剖面点 ${{idx + 1}}\\n航线 ${{alt.toFixed(1)}}m / 地形 ${{firstFinite(sample, ["terrain_msl_m", "terrain_m"]).toFixed(1)}}m`;
+      if (!profileMarkerEntity) {{
+        profileMarkerEntity = viewer.entities.add({{
+          name: "剖面联动高亮点",
+          position,
+          point: {{
+            pixelSize: 12,
+            color: Cesium.Color.ORANGE,
+            outlineColor: Cesium.Color.BLACK,
+            outlineWidth: 2
+          }},
+          label: {{
+            text,
+            font: "12px sans-serif",
+            fillColor: Cesium.Color.WHITE,
+            outlineColor: Cesium.Color.BLACK,
+            outlineWidth: 3,
+            style: Cesium.LabelStyle.FILL_AND_OUTLINE,
+            pixelOffset: new Cesium.Cartesian2(0, -28),
+            verticalOrigin: Cesium.VerticalOrigin.BOTTOM
+          }}
+        }});
+      }} else {{
+        profileMarkerEntity.position = position;
+        profileMarkerEntity.label.text = text;
+        profileMarkerEntity.show = true;
+      }}
+      return profileMarkerEntity;
+    }}
+
+    function highlightProfileSample(route, sample, idx) {{
+      addProfileMarker(route, sample, idx);
+      profileEl.querySelectorAll("[data-sample-idx]").forEach((node) => {{
+        node.classList.toggle("is-active", Number(node.dataset.sampleIdx) === idx);
+      }});
+      viewer.scene.requestRender();
+    }}
+
+    function firstFinite(sample, keys) {{
+      for (const key of keys) {{
+        const value = Number(sample[key]);
+        if (Number.isFinite(value)) return value;
+      }}
+      return NaN;
+    }}
+
+    function renderProfile(route) {{
+      const samples = (route.profile_samples || []).filter((sample) => {{
+        return Number.isFinite(Number(sample.distance_m)) &&
+          Number.isFinite(firstFinite(sample, ["route_alt_msl_m", "alt_m"]));
+      }});
+      const corridor = route.corridor || {{}};
+      const halfWidthM = Number(corridor.horizontal_half_width_m || 0);
+      const halfHeightM = Number(corridor.vertical_half_height_m || 0);
+      if (samples.length < 2) {{
+        profileEl.innerHTML = "<strong>高度剖面</strong><div class='profile-note'>当前航线没有足够剖面采样点。</div>";
+        return;
+      }}
+      const valuePool = [];
+      samples.forEach((sample) => {{
+        const terrain = firstFinite(sample, ["terrain_msl_m", "terrain_m"]);
+        const surface = firstFinite(sample, ["surface_msl_m", "surface_m"]);
+        const routeAlt = firstFinite(sample, ["route_alt_msl_m", "alt_m"]);
+        [terrain, surface, routeAlt, routeAlt - halfHeightM, routeAlt + halfHeightM].forEach((value) => {{
+          if (Number.isFinite(value)) valuePool.push(value);
+        }});
+      }});
+      if (!valuePool.length) {{
+        profileEl.innerHTML = "<strong>高度剖面</strong><div class='profile-note'>当前航线没有可绘制的地形/高度数据。</div>";
+        return;
+      }}
+      const svgW = 328;
+      const svgH = 142;
+      const left = 34;
+      const right = 10;
+      const top = 12;
+      const bottom = 24;
+      const plotW = svgW - left - right;
+      const plotH = svgH - top - bottom;
+      const maxDist = Math.max(1, ...samples.map((sample) => Number(sample.distance_m || 0)));
+      const minH = Math.floor(Math.min(...valuePool) / 10) * 10 - 5;
+      const maxH = Math.ceil(Math.max(...valuePool) / 10) * 10 + 5;
+      const toX = (distanceM) => left + (Number(distanceM || 0) / maxDist) * plotW;
+      const toY = (heightM) => top + (1 - ((Number(heightM) - minH) / Math.max(1, maxH - minH))) * plotH;
+      const pathFor = (keys, offsetM) => samples
+        .map((sample) => {{
+          const yValue = firstFinite(sample, keys);
+          if (!Number.isFinite(yValue)) return "";
+          return toX(sample.distance_m).toFixed(1) + "," + toY(yValue + offsetM).toFixed(1);
+        }})
+        .filter(Boolean)
+        .join(" ");
+      const terrainPath = pathFor(["terrain_msl_m", "terrain_m"], 0);
+      const surfacePath = pathFor(["surface_msl_m", "surface_m"], 0);
+      const routePath = pathFor(["route_alt_msl_m", "alt_m"], 0);
+      const upperPath = pathFor(["route_alt_msl_m", "alt_m"], halfHeightM);
+      const lowerPath = pathFor(["route_alt_msl_m", "alt_m"], -halfHeightM);
+      const profileDots = samples.map((sample, idx) => {{
+        const routeAlt = firstFinite(sample, ["route_alt_msl_m", "alt_m"]);
+        if (!Number.isFinite(routeAlt)) return "";
+        return "<circle class='profile-hit' data-sample-idx='" + idx + "' cx='" +
+          toX(sample.distance_m).toFixed(1) + "' cy='" + toY(routeAlt).toFixed(1) +
+          "' r='4.2' fill='#1565c0' stroke='#ffffff' stroke-width='1.4' tabindex='0'/>";
+      }}).join("");
+      const yMin = toY(minH).toFixed(1);
+      const yMax = toY(maxH).toFixed(1);
+      const note = "保护外廓：水平±" + halfWidthM.toFixed(0) + "m，垂直±" + halfHeightM.toFixed(0) + "m；剖面点可悬停联动地图。";
+      profileEl.innerHTML =
+        "<strong>高度剖面</strong>" +
+        "<div class='profile-note'>" + note + "</div>" +
+        "<svg class='profile-chart' viewBox='0 0 " + svgW + " " + svgH + "' aria-label='高度剖面'>" +
+        "<line x1='" + left + "' y1='" + top + "' x2='" + left + "' y2='" + (svgH - bottom) + "' stroke='#d8dee9'/>" +
+        "<line x1='" + left + "' y1='" + (svgH - bottom) + "' x2='" + (svgW - right) + "' y2='" + (svgH - bottom) + "' stroke='#d8dee9'/>" +
+        "<text x='4' y='" + yMax + "' font-size='10' fill='#607080'>" + maxH.toFixed(0) + "m</text>" +
+        "<text x='4' y='" + yMin + "' font-size='10' fill='#607080'>" + minH.toFixed(0) + "m</text>" +
+        "<polyline points='" + upperPath + "' fill='none' stroke='#90caf9' stroke-width='1.5' stroke-dasharray='4 3'/>" +
+        "<polyline points='" + lowerPath + "' fill='none' stroke='#90caf9' stroke-width='1.5' stroke-dasharray='4 3'/>" +
+        "<polyline points='" + terrainPath + "' fill='none' stroke='#78909c' stroke-width='2'/>" +
+        "<polyline points='" + surfacePath + "' fill='none' stroke='#8d6e63' stroke-width='2'/>" +
+        "<polyline points='" + routePath + "' fill='none' stroke='#1565c0' stroke-width='2.6'/>" +
+        profileDots +
+        "</svg>" +
+        "<div class='profile-legend'>" +
+        "<span><i class='profile-swatch' style='background:#78909c'></i>地形</span>" +
+        "<span><i class='profile-swatch' style='background:#8d6e63'></i>地表/障碍物顶面</span>" +
+        "<span><i class='profile-swatch' style='background:#1565c0'></i>航线高度</span>" +
+        "<span><i class='profile-swatch' style='background:#90caf9'></i>垂直边界</span>" +
+        "</div>";
+      profileEl.querySelectorAll("[data-sample-idx]").forEach((node) => {{
+        const idx = Number(node.dataset.sampleIdx);
+        const handler = () => highlightProfileSample(route, samples[idx], idx);
+        node.addEventListener("mouseenter", handler);
+        node.addEventListener("focus", handler);
+        node.addEventListener("click", handler);
+      }});
+    }}
+
+    function renderControls(payload) {{
+      metricsEl.innerHTML = "";
+      const selected = (payload.routes || []).find((route) => route.id === payload.default_route_id) || (payload.routes || [])[0] || {{}};
+      const alts = (selected.points || []).map((point) => Number(point.alt || 0));
+      const corridor = selected.corridor || {{}};
+      const halfWidthM = Number(corridor.horizontal_half_width_m || 0);
+      const halfHeightM = Number(corridor.vertical_half_height_m || 0);
+      const metrics = [
+        ["航线", payload.metrics?.route_count || 0],
+        ["图层", payload.metrics?.layer_count || 0],
+        ["要素", payload.metrics?.feature_count || 0],
+        ["最高高度", alts.length ? `${{Math.max(...alts).toFixed(1)}} m` : "-"],
+        ["避让体积", halfWidthM > 0 && halfHeightM > 0 ? `±${{halfWidthM.toFixed(0)}}m / ±${{halfHeightM.toFixed(0)}}m` : "-"]
+      ];
+      metrics.forEach(([label, value]) => {{
+        const div = document.createElement("div");
+        div.className = "metric";
+        div.innerHTML = `${{label}}<strong>${{value}}</strong>`;
+        metricsEl.appendChild(div);
+      }});
+
+      routesEl.innerHTML = "<strong>航线</strong>";
+      (payload.routes || []).forEach((route) => {{
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML = `<label><input type="checkbox" ${{route.selected ? "checked" : ""}}><span>${{route.label || route.id}}</span></label><button type="button">定位</button>`;
+        const checkbox = row.querySelector("input");
+        const button = row.querySelector("button");
+        checkbox.addEventListener("change", () => setEntityGroupVisible(routeEntities.get(route.id), checkbox.checked));
+        button.addEventListener("click", () => viewer.flyTo(routeEntities.get(route.id) || []));
+        routesEl.appendChild(row);
+      }});
+      renderProfile(selected);
+
+      layersEl.innerHTML = "<strong>图层</strong>";
+      (payload.layers || []).forEach((layer) => {{
+        const row = document.createElement("div");
+        row.className = "row";
+        row.innerHTML = `<label><input type="checkbox" ${{layer.show ? "checked" : ""}}><span>${{layer.label}}</span></label><span>${{(layer.features || []).length}}</span>`;
+        const checkbox = row.querySelector("input");
+        checkbox.addEventListener("change", () => setEntityGroupVisible(layerEntities.get(layer.id), checkbox.checked));
+        layersEl.appendChild(row);
+      }});
+    }}
+
+    renderBasemaps();
+    renderTerrainModes();
+    fetch(payloadUrl, {{ cache: "no-store" }})
+      .then((response) => {{
+        if (!response.ok) throw new Error(`HTTP ${{response.status}}`);
+        return response.json();
+      }})
+      .then((payload) => {{
+        loadedPayload = payload;
+        (payload.routes || []).forEach(addRoute);
+        (payload.layers || []).forEach((layer) => {{
+          const entities = [];
+          (layer.features || []).forEach((feature) => {{
+            entities.push(...flattenEntities(addFeature(layer, feature)));
+          }});
+          setEntityGroupVisible(entities, !!layer.show);
+          layerEntities.set(layer.id, entities);
+        }});
+        renderControls(payload);
+        const defaultEntities = routeEntities.get(payload.default_route_id) || Array.from(routeEntities.values()).flat();
+        if (defaultEntities.length) viewer.flyTo(defaultEntities);
+        setStatus(`已加载 ${{payload.name || ""}}。如果看不到底图，请检查网络/CDN访问。`, false);
+        applyTerrain(activeTerrainId);
+      }})
+      .catch((error) => {{
+        setStatus(`无法加载本地数据文件 ${{payloadUrl}}。浏览器直接打开 file:// 时可能会拦截 JSON 请求；请从本目录启动本地静态服务后打开本页。错误：${{error.message}}`, true);
+      }});
+  </script>
+</body>
+</html>
+"""
+    path.write_text(html_text, encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Automatic OD route planner for urban UAV logistics.")
     parser.add_argument("--city", required=True, help="City name for cache and context.")
@@ -11607,13 +12765,16 @@ def main() -> None:
     out_dir = (root / args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     base_name = args.name.strip() or "auto_route"
-    kml_out = out_dir / f"{base_name}.kml"
-    html_out = out_dir / f"{base_name}.html"
-    meta_out = out_dir / f"{base_name}_meta.json"
-    cand_out = out_dir / f"{base_name}_candidates.json"
-    pareto_out = out_dir / f"{base_name}_pareto.json"
-    coverage_out = out_dir / f"{base_name}_coverage.json"
-    evidence_out = out_dir / f"{base_name}_evidence.json"
+    output_paths = build_route_output_paths(out_dir, base_name)
+    kml_out = output_paths["kml"]
+    html_out = output_paths["preview_html"]
+    meta_out = output_paths["meta_json"]
+    cand_out = output_paths["candidates_json"]
+    pareto_out = output_paths["pareto_json"]
+    coverage_out = output_paths["coverage_json"]
+    evidence_out = output_paths["evidence_json"]
+    cesium_json_out = output_paths["cesium_json"]
+    cesium_html_out = output_paths["cesium_html"]
     snapshot_root = Path(args.snapshot_dir).resolve() if args.snapshot_dir else (out_dir / "snapshots").resolve()
     snapshot_out = snapshot_root / f"{base_name}_snapshot.json"
     emergency_kml_out = out_dir / f"{base_name}_emergency_branches.kml"
@@ -12635,6 +13796,41 @@ def main() -> None:
         name=base_name,
         layer_source_status=layer_source_status,
     )
+    cesium_payload = build_cesium_payload(
+        name=base_name,
+        candidate_routes_wgs=candidate_routes_wgs_for_html,
+        route_points=points_wgs_alt,
+        start_wgs=start_wgs,
+        end_wgs=end_wgs,
+        custom_no_fly_polys_xy=custom_nofly_polys_xy,
+        civil_airport_polys_xy=civil_airport_display_polys_xy,
+        military_hard_nofly_polys_xy=nofly_military_hard_polys_xy,
+        heli_soft_nofly_polys_xy=nofly_heli_soft_polys_xy,
+        existing_route_lines_xy=existing_route_lines_xy,
+        existing_route_corridors_xy=existing_route_corridors_xy,
+        existing_route_relief_union_xy=existing_route_relief_union_xy,
+        dynamic_grb_xy=dynamic_grb_xy,
+        landuse_geoms_xy=landuse_geoms,
+        landuse_costs=landuse_costs,
+        all_building_polys_xy=b_geoms,
+        high_building_polys_xy=high_building_polys_xy,
+        crowd_points_xy=crowd_points_xy,
+        key_points_xy=key_points_xy,
+        infra_geoms_xy=infra_geoms,
+        high_road_lines_xy=high_road_lines_xy,
+        hsr_lines_xy=hsr_lines_xy,
+        hv_power_lines_xy=hv_power_lines_xy,
+        line_risk_union_xy=line_risk_union_xy,
+        school_hard_zones_xy=school_hard_zones_xy,
+        school_points_xy=school_points_xy,
+        population_points_wgs=population_points_wgs,
+        emergency_routes=emergency_routes_for_html,
+        quality_variants=quality_variants_for_html,
+        layer_source_status=layer_source_status,
+        inv=inv,
+    )
+    cesium_json_out.write_text(json.dumps(cesium_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_cesium_viewer_html(cesium_html_out, cesium_json_out, base_name)
     cand_out.write_text(json.dumps(candidate_summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     route_len_km = route_line_xy.length / 1000.0
@@ -12778,6 +13974,8 @@ def main() -> None:
             "kml": str(kml_out),
             "candidate_kmls": candidate_kml_outputs,
             "preview_html": str(html_out),
+            "cesium_json": str(cesium_json_out),
+            "cesium_html": str(cesium_html_out),
             "candidates_json": str(cand_out),
             "pareto_json": str(pareto_out),
             "coverage_json": str(coverage_out),
@@ -12827,6 +14025,8 @@ def main() -> None:
                     "kml": str(kml_out),
                     "candidate_kmls": candidate_kml_outputs,
                     "preview_html": str(html_out),
+                    "cesium_json": str(cesium_json_out),
+                    "cesium_html": str(cesium_html_out),
                     "meta_json": str(meta_out),
                     "candidates_json": str(cand_out),
                     "pareto_json": str(pareto_out),
@@ -12857,6 +14057,8 @@ def main() -> None:
     for cid in sorted(candidate_kml_outputs.keys()):
         print(f"Candidate KML ({cid}): {candidate_kml_outputs[cid]}")
     print(f"Preview HTML: {html_out}")
+    print(f"Cesium JSON: {cesium_json_out}")
+    print(f"Cesium HTML: {cesium_html_out}")
     print(f"Meta: {meta_out}")
     print(f"Candidates: {cand_out}")
     print(f"Pareto: {pareto_out}")
